@@ -6470,15 +6470,14 @@ def index_page():
                                 return TagEngine._build_detailed_prompt_fallback(prompt_text, tags_dict, ai_payload, source_path), 'Local'
 
                             if provider == 'ollama':
-                                if not str(prompt_text or '').strip():
-                                    generated = ', '.join(list((tags_dict or {}).keys())[:25])
-                                    return generated, 'Local (fallback ancré)'
+                                # Toujours appeler ollama — tags passés en contexte si présents, sinon "none"
                                 return _ollama_raw_prompt(model, prompt_text, tags_dict), f'Ollama: {model}'
 
-                            generated = prompt_text or ', '.join(list(tags_dict.keys())[:25])
+                            # Moteur local : prompt_text en priorité, tags en contexte secondaire
+                            generated = prompt_text or (', '.join(list(tags_dict.keys())[:25]) if tags_dict else '')
                             if not generated and source_path:
                                 generated = f"Prompt based on {os.path.basename(source_path)}"
-                            return generated, 'Local'
+                            return generated or '', 'Local'
 
                         async def prompt_to_tags_action(run_search_after: bool = False):
                             req_id = _start_prompt_request('p2t')
@@ -6600,16 +6599,13 @@ def index_page():
                                     _finish_prompt_request(req_id)
                                     return _safe_notify('Ajoutez un prompt, des tags, ou sélectionnez des photos analysées.', 'warning')
 
-                                # When force_overwrite is ON, we strip the metadata prompt.
-                                # If there are also no tags, the LLM has nothing real to work with and will hallucinate.
-                                if force_overwrite and not tags_dict and not shared_prompt_hint:
-                                    _set_prompt_status('échec: tags manquants pour régénération sans métadonnées', busy=False)
+                                # When force_overwrite is ON and there's truly nothing (no hint, no tags, no image), block.
+                                if force_overwrite and not tags_dict and not shared_prompt_hint and not source_path:
+                                    _set_prompt_status('échec: contexte insuffisant pour régénération', busy=False)
                                     _set_prompt_batch_progress('')
                                     _finish_prompt_request(req_id)
                                     return _safe_notify(
-                                        'Écraser les métadonnées nécessite des tags analysés. '
-                                        'Analysez ces photos dans l\'onglet "Tags Danbooru" d\'abord, '
-                                        'ou entrez une description manuellement dans le champ texte.',
+                                        'Écraser les métadonnées nécessite au moins une description ou une image sélectionnée.',
                                         'warning'
                                     )
 
@@ -6643,9 +6639,11 @@ def index_page():
                                             item_tags[tag] = max(float(item_tags.get(tag, 0.0)), tag_prob)
                                         item_ai_payload = item_ctx['ai_payload'] if isinstance(item_ctx['ai_payload'], dict) else {}
 
-                                        if not item_prompt and not item_tags:
+                                        # Ne passer que si pas de prompt ET pas de tags ET pas de chemin source
+                                        # (ollama peut générer à partir du nom de fichier seul)
+                                        if not item_prompt and not item_tags and not path:
                                             errors += 1
-                                            _ollama_trace('ui.generate_prompt.batch.skip', path=path, reason='insufficient_context')
+                                            _ollama_trace('ui.generate_prompt.batch.skip', path=path, reason='no_context_at_all')
                                             continue
 
                                         _set_prompt_status(f'génération batch {batch_index}/{total}', busy=True)
@@ -7481,15 +7479,12 @@ def index_page():
                     def bg_task():
                         try:
                             state.add_log(f"[PROMPT] Lecture des images : '{prompt_dir.value}'")
-                            tag_engine.batch_size = int(cfg.get('tags_batch_size', 8))
-                            tag_engine.video_frames = int(cfg.get('tags_video_frames', 4))
                             if force_reindex:
                                 state.add_log('[PROMPT] Relecture forcée demandée.')
                                 deleted_prompt, deleted_detailed = clear_prompt_folder_cache(prompt_dir.value)
                                 state.add_log(
-                                    f"[PROMPT] Cache réinitialisé pour le dossier: {deleted_prompt} prompt(s), {deleted_detailed} prompt(s) détaillé(s) supprimé(s)."
+                                    f"[PROMPT] Cache réinitialisé: {deleted_prompt} prompt(s), {deleted_detailed} prompt(s) détaillé(s) supprimé(s)."
                                 )
-                            tag_engine.evaluate_media(prompt_dir.value, cfg.get('tags_model', 'SmilingWolf/wd-swinv2-tagger-v3'), tuple(exts))
                         except Exception as e:
                             state.add_log(f"[PROMPT] Erreur lecture images: {e}")
                         finally:
