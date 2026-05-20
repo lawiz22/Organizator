@@ -1,0 +1,25 @@
+# Dépendances supplémentaires pour Organizator
+# (complète requirements.txt de MediaMind AI, utilise le même .venv)
+
+# Base de données PostgreSQL (async)
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.9
+
+# Métadonnées audio (MP3, FLAC, WAV, M4A, etc.)
+mutagen>=1.47.0
+
+# Métadonnées images / EXIF
+exifread>=3.0.0
+
+# Métadonnées PDF
+PyPDF2>=3.0.1
+
+# Métadonnées documents Office
+python-docx>=1.1.0
+openpyxl>=3.1.2
+
+# Checksum / hashing
+xxhash>=3.4.1
+
+# Corbeille (Windows/macOS/Linux)
+send2trash>=1.8.3

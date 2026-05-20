@@ -1,0 +1,4 @@
+* text=auto
+
+# Keep Windows batch files in CRLF
+*.bat text eol=crlf

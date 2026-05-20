@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+
+# Local tooling cache
+.uv/
+.uv_cache/
+.uv_python/
+.bin/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Databases and local runtime artifacts
+*.db
+*.sqlite
+*.sqlite3
+
+# Organizator generated artifacts
+rapport_organizator_*.json
+rapport_organizator_compact_*.json
+
+# Runtime cache / logs
+dir_cache.json
+crash_runtime.log
+
+# Large model files (multi-GB, not tracked in git)
+models/
+*.safetensors
+*.onnx
+*.bin
+*.pt
+*.pth

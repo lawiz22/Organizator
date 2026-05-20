@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: organizator_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: organizator
+      POSTGRES_USER: organizator
+      POSTGRES_PASSWORD: organizator2026
+    ports:
+      - "5432:5432"
+    volumes:
+      - organizator_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U organizator -d organizator"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  organizator_pgdata:
+    driver: local

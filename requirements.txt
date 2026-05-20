@@ -1,0 +1,35 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+torch==2.11.0+cu130
+torchvision==0.26.0+cu130
+torchaudio==2.11.0+cu130
+triton-windows
+https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0-windows.post4/sageattention-2.2.0+cu130torch2.9.0andhigher.post4-cp39-abi3-win_amd64.whl
+
+nicegui>=3.0.0
+pywebview
+sentence-transformers
+qwen-vl-utils
+pillow
+av
+bitsandbytes
+accelerate
+opencv-python
+python-dotenv
+aesthetic_predictor_v2_5
+
+# Danbooru Tags dependencies:
+pandas
+
+# Пакеты для поиска по лицу:
+# insightface
+# onnxruntime-gpu
+# nvidia-cublas-cu12
+# nvidia-cudnn-cu12
+# nvidia-cufft-cu12
+# nvidia-curand-cu12
+# nvidia-cusolver-cu12
+# nvidia-cusparse-cu12
+# nvidia-cuda-runtime-cu12
+https://huggingface.co/ussoewwin/Insightface_for_windows/resolve/main/insightface-0.7.3-cp313-cp313-win_amd64.whl
+https://huggingface.co/ussoewwin/onnxruntime-gpu-1.24.0/resolve/main/onnxruntime_gpu-1.24.0-cp313-cp313-win_amd64.whl
