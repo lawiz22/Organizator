@@ -1,7 +1,5 @@
 ﻿<div align="center">
 
-<img src="assets/preview.jpg" alt="Organizator Preview" width="900" style="border-radius:12px"/>
-
 <h1>🗂️ Organizator</h1>
 
 <p><strong>Suite locale d'organisation et d'analyse de médias — pilotée par IA</strong></p>
@@ -53,14 +51,6 @@
 - **Export HTML/JSON** des résultats de recherche
 
 ---
-
-## 🖥️ Interface
-
-<div align="center">
-
-> *Media Mind AI — Recherche sémantique sur 19 000+ fichiers en quelques secondes*
-
-</div>
 
 L'interface tourne sur **http://127.0.0.1:8191** (Organizator) et **http://127.0.0.1:8888** (Media Mind AI).
 
