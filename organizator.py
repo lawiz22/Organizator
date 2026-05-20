@@ -207,6 +207,7 @@ class OrganizerState:
         self.current_step = 0           # Étape active (0-5)
         self.is_scanning = False
         self.is_organizing = False
+        self.is_loading = False          # UI rebuild in progress (prevent WS timeout)
         self.cancel_flag = False
 
         # Config
@@ -2821,6 +2822,9 @@ def main_page():
         ui.label().bind_text_from(state, "status_text").classes(
             "text-blue-300 font-mono text-xs truncate max-w-[35%]"
         )
+        ui.spinner(size="xs", color="blue").bind_visibility_from(
+            state, "is_loading"
+        ).classes("shrink-0")
         ui.linear_progress(value=0, show_value=False).bind_value_from(
             state, "progress"
         ).classes("flex-grow h-1.5 rounded")
@@ -2851,47 +2855,83 @@ def main_page():
             "real_images_ui": None,
         }
 
-        def go_from_step2():
+        async def go_from_step2():
             """Lazy-refresh étape 3 au moment de la navigation depuis l'étape 2."""
+            state.is_loading = True
+            state.status_text = "⏳ Chargement sélection..."
+            await asyncio.sleep(0)
             selection_ui.refresh()
+            await asyncio.sleep(0)
             if step_refresh_refs["video_selection_ui"]:
                 step_refresh_refs["video_selection_ui"]()
             if step_refresh_refs["ia_images_ui"]:
                 step_refresh_refs["ia_images_ui"]()
             if step_refresh_refs["real_images_ui"]:
                 step_refresh_refs["real_images_ui"]()
+            state.is_loading = False
+            state.status_text = "✅ Prêt"
             stepper.next()
 
-        def go_from_step3():
+        async def go_from_step3():
             if state.uncategorized:
+                state.is_loading = True
+                state.status_text = "⏳ Chargement fichiers non catégorisés..."
+                await asyncio.sleep(0)
                 if step_refresh_refs["uncategorized_table"]:
                     step_refresh_refs["uncategorized_table"]()
                 if step_refresh_refs["uncategorized_label"]:
                     step_refresh_refs["uncategorized_label"]()
+                state.is_loading = False
+                state.status_text = "✅ Prêt"
                 stepper.set_value("Étape 4")
                 return
             if state.installer_files:
+                state.is_loading = True
+                state.status_text = "⏳ Chargement installeurs..."
+                await asyncio.sleep(0)
                 if step_refresh_refs["installers_ui"]:
                     step_refresh_refs["installers_ui"]()
+                state.is_loading = False
+                state.status_text = "✅ Prêt"
                 stepper.set_value("Étape 5")
                 return
+            state.is_loading = True
+            state.status_text = "⏳ Chargement résumé..."
+            await asyncio.sleep(0)
             if step_refresh_refs["summary_ui"]:
                 step_refresh_refs["summary_ui"]()
+            state.is_loading = False
+            state.status_text = "✅ Prêt"
             stepper.set_value("Étape 6")
 
-        def go_from_step4():
+        async def go_from_step4():
             if state.installer_files:
+                state.is_loading = True
+                state.status_text = "⏳ Chargement installeurs..."
+                await asyncio.sleep(0)
                 if step_refresh_refs["installers_ui"]:
                     step_refresh_refs["installers_ui"]()
+                state.is_loading = False
+                state.status_text = "✅ Prêt"
                 stepper.set_value("Étape 5")
                 return
+            state.is_loading = True
+            state.status_text = "⏳ Chargement résumé..."
+            await asyncio.sleep(0)
             if step_refresh_refs["summary_ui"]:
                 step_refresh_refs["summary_ui"]()
+            state.is_loading = False
+            state.status_text = "✅ Prêt"
             stepper.set_value("Étape 6")
 
-        def go_from_step5():
+        async def go_from_step5():
+            state.is_loading = True
+            state.status_text = "⏳ Chargement résumé..."
+            await asyncio.sleep(0)
             if step_refresh_refs["summary_ui"]:
                 step_refresh_refs["summary_ui"]()
+            state.is_loading = False
+            state.status_text = "✅ Prêt"
             stepper.set_value("Étape 6")
 
         # ================================================================
@@ -3169,13 +3209,15 @@ def main_page():
                             for entry in video_entries
                         )
 
-                    def refresh_selection_dependent_panels():
+                    async def refresh_selection_dependent_panels():
+                        state.is_loading = True
+                        await asyncio.sleep(0)
                         selection_ui.refresh()
                         if video_selection_refresh_ref.get("fn"):
                             video_selection_refresh_ref["fn"]()
                         if music_metadata_refresh_ref.get("fn"):
                             music_metadata_refresh_ref["fn"]()
-
+                        state.is_loading = False
                     _sel_expand: dict = {}   # état collapse/expand des catégories
                     _sub_expand: dict = {}   # état collapse/expand des listes de fichiers par sous-catégorie
                     _sub_page:   dict = {}   # page courante par sous-catégorie (pagination)
@@ -3230,21 +3272,21 @@ def main_page():
 
                                             # Boutons Tout / Rien
                                             with ui.row().classes("gap-2 mb-1"):
-                                                def _select_all(c=cat, subs=sub_keys):
+                                                async def _select_all(c=cat, subs=sub_keys):
                                                     for s in subs:
                                                         state.selected_categories[(c, s)] = True
                                                     if c == "PHOTO-VIDEO" and "Video" in subs:
                                                         for entry in get_video_entries():
                                                             state.selected_files[entry.path] = True
-                                                    refresh_selection_dependent_panels()
+                                                    await refresh_selection_dependent_panels()
 
-                                                def _deselect_all(c=cat, subs=sub_keys):
+                                                async def _deselect_all(c=cat, subs=sub_keys):
                                                     for s in subs:
                                                         state.selected_categories[(c, s)] = False
                                                     if c == "PHOTO-VIDEO" and "Video" in subs:
                                                         for entry in get_video_entries():
                                                             state.selected_files[entry.path] = False
-                                                    refresh_selection_dependent_panels()
+                                                    await refresh_selection_dependent_panels()
 
                                                 ui.button("✅ Tout organiser", on_click=_select_all).props(
                                                     f"flat dense size=sm color={color}"
@@ -3266,7 +3308,7 @@ def main_page():
                                                     bg_cls  = "bg-gray-700" if is_sel else "bg-gray-900"
                                                     bdr_cls = f"border-{color}-600" if is_sel else "border-gray-700"
 
-                                                    def _on_action(e, k=key, c=cat, sc=subcat, es=entries):
+                                                    async def _on_action(e, k=key, c=cat, sc=subcat, es=entries):
                                                         new_is_org = (e.value == "Organiser")
                                                         state.selected_categories[k] = new_is_org
                                                         # Recalculer les overrides par fichier selon la nouvelle action
@@ -3281,7 +3323,7 @@ def main_page():
                                                         else:
                                                             for entry in es:
                                                                 state.selected_files[entry.path] = new_is_org
-                                                        refresh_selection_dependent_panels()
+                                                        await refresh_selection_dependent_panels()
 
                                                     with ui.card().classes(
                                                         f"w-full {bg_cls} border {bdr_cls} p-3"
@@ -3324,14 +3366,15 @@ def main_page():
                                                                 with ui.row().classes(
                                                                     "w-full items-center gap-2 px-3 py-2 border-b border-gray-700"
                                                                 ):
-                                                                    def _chk_all(es=entries, k=sub_key, io=is_sel):
+                                                                    async def _chk_all(es=entries, k=sub_key, io=is_sel):
                                                                         for ent in es:
                                                                             _file_checked.pop(ent.path, None)
                                                                             # checked=True + is_org = is_org (défaut) → retirer override
                                                                             state.selected_files.pop(ent.path, None)
+                                                                        await asyncio.sleep(0)
                                                                         selection_ui.refresh()
 
-                                                                    def _unchk_all(es=entries, k=sub_key, io=is_sel):
+                                                                    async def _unchk_all(es=entries, k=sub_key, io=is_sel):
                                                                         for ent in es:
                                                                             _file_checked[ent.path] = False
                                                                             # checked=False → will_org = not is_org
@@ -3340,6 +3383,7 @@ def main_page():
                                                                                 state.selected_files.pop(ent.path, None)
                                                                             else:
                                                                                 state.selected_files[ent.path] = will_org
+                                                                        await asyncio.sleep(0)
                                                                         selection_ui.refresh()
 
                                                                     ui.button(
@@ -3497,11 +3541,11 @@ def main_page():
                                         "Inclure les vidéos dans l'organisation",
                                         value=state.selected_categories.get(vid_key, True),
                                     )
-                                    def _on_vid_all_tab(e):
+                                    async def _on_vid_all_tab(e):
                                         state.selected_categories[("PHOTO-VIDEO", "Video")] = e.value
                                         for ent in get_video_entries():
                                             state.selected_files[ent.path] = e.value
-                                        refresh_selection_dependent_panels()
+                                        await refresh_selection_dependent_panels()
                                     chk_vid_all.on_value_change(_on_vid_all_tab)
                                     ui.label(
                                         f"{len(video_entries_tab):,} vidéos — {fmt_size(sum(e.size for e in video_entries_tab))}"
