@@ -4514,38 +4514,47 @@ def index_page():
         else:
             ui.notify(f"{deleted} fichier(s) supprimé(s)", type='positive')
 
-    def save_aesthetic_scores_action():
+    async def save_aesthetic_scores_action():
         """Écrit _aesthetic.json à côté de chaque image dans les résultats esthétiques."""
         sel = {p for p, checked in state.sel_aes.items() if checked}
         items = [i for i in state.aesthetic_results if (not sel or i[1] in sel)]
         if not items:
             return ui.notify('Aucun résultat esthétique à sauvegarder.', type='warning')
-        written = 0
-        errors = 0
-        for avg_score, path, max_score in items:
-            try:
-                stem = os.path.splitext(path)[0]
-                out_path = stem + '_aesthetic.json'
-                data = {
-                    "schema": "organizador.aesthetic.v1",
-                    "result": {
-                        "avg_score": round(float(avg_score), 6),
-                        "max_score": round(float(max_score), 6),
-                        "model": "v2_5_siglip"
+
+        ui.notify(f"💾 Sauvegarde de {len(items):,} fichiers...", type='info', timeout=2000)
+        state.add_log(f"[AES] Sauvegarde de {len(items):,} scores _aesthetic.json...")
+
+        def _write_all():
+            written = 0
+            errors = 0
+            for avg_score, path, max_score in items:
+                try:
+                    stem = os.path.splitext(path)[0]
+                    out_path = stem + '_aesthetic.json'
+                    data = {
+                        "schema": "organizador.aesthetic.v1",
+                        "result": {
+                            "avg_score": round(float(avg_score), 6),
+                            "max_score": round(float(max_score), 6),
+                            "model": "v2_5_siglip"
+                        }
                     }
-                }
-                with open(out_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=2)
-                written += 1
-            except Exception as e:
-                errors += 1
-                state.add_log(f"[AES] Erreur écriture sidecar {os.path.basename(path)}: {e}")
+                    with open(out_path, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, indent=2)
+                    written += 1
+                except Exception as e:
+                    errors += 1
+                    state.add_log(f"[AES] Erreur écriture sidecar {os.path.basename(path)}: {e}")
+            return written, errors
+
+        written, errors = await run.io_bound(_write_all)
         if errors:
             ui.notify(f"Sauvegardés: {written} | erreurs: {errors}", type='warning')
         else:
             ui.notify(f"✅ {written} score(s) sauvegardé(s) en _aesthetic.json", type='positive')
+        state.add_log(f"[AES] ✅ {written} _aesthetic.json écrits" + (f" ({errors} erreurs)" if errors else ""))
 
-    def write_tags_sidecar_files(file_format='txt', threshold=0.0):
+    async def write_tags_sidecar_files(file_format='txt', threshold=0.0):
         """Écrit les tags à côté de chaque média (.txt ou .json)."""
         if file_format not in {'txt', 'json'}:
             return ui.notify('Format non supporté', type='warning')
@@ -4568,66 +4577,79 @@ def index_page():
         if not source_items:
             return ui.notify('Aucun résultat tags à écrire.', type='warning')
 
-        written = 0
-        errors = 0
+        ui.notify(f"💾 Écriture de {len(source_items):,} sidecars {file_format.upper()}...", type='info', timeout=2000)
 
-        for _score, media_path, tags_dict in source_items:
-            try:
-                p = Path(media_path)
-                out_path = p.with_suffix('.json' if file_format == 'json' else '.txt')
+        threshold_val = float(threshold)
 
-                sorted_tags = sorted(tags_dict.items(), key=lambda x: x[1], reverse=True)
-                filtered_tags = [(k, v) for k, v in sorted_tags if float(v) >= float(threshold)]
+        def _write_all():
+            written = 0
+            errors = 0
+            for _score, media_path, tags_dict in source_items:
+                try:
+                    p = Path(media_path)
+                    out_path = p.with_suffix('.json' if file_format == 'json' else '.txt')
 
-                if file_format == 'json':
-                    payload = {
-                        'schema': 'organizador.tags.validation.v1',
-                        'source_file': str(p),
-                        'file_name': p.name,
-                        'written_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                        'threshold': float(threshold),
-                        'tags': {k: f"{float(v)*100:.2f}%" for k, v in sorted_tags},
-                    }
-                    with open(out_path, 'w', encoding='utf-8') as f:
-                        json.dump(payload, f, indent=2, ensure_ascii=False)
-                else:
-                    tag_names = [k for k, _v in filtered_tags]
-                    with open(out_path, 'w', encoding='utf-8') as f:
-                        f.write(', '.join(tag_names))
+                    sorted_tags = sorted(tags_dict.items(), key=lambda x: x[1], reverse=True)
+                    filtered_tags = [(k, v) for k, v in sorted_tags if float(v) >= threshold_val]
 
-                written += 1
-            except Exception as e:
-                errors += 1
-                state.add_log(f"[TAGS] Erreur écriture sidecar {media_path}: {e}")
+                    if file_format == 'json':
+                        payload = {
+                            'schema': 'organizador.tags.validation.v1',
+                            'source_file': str(p),
+                            'file_name': p.name,
+                            'written_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            'threshold': threshold_val,
+                            'tags': {k: f"{float(v)*100:.2f}%" for k, v in sorted_tags},
+                        }
+                        with open(out_path, 'w', encoding='utf-8') as f:
+                            json.dump(payload, f, indent=2, ensure_ascii=False)
+                    else:
+                        tag_names = [k for k, _v in filtered_tags]
+                        with open(out_path, 'w', encoding='utf-8') as f:
+                            f.write(', '.join(tag_names))
 
+                    written += 1
+                except Exception as e:
+                    errors += 1
+                    state.add_log(f"[TAGS] Erreur écriture sidecar {media_path}: {e}")
+            return written, errors
+
+        written, errors = await run.io_bound(_write_all)
         if errors:
             ui.notify(f"Tags écrits: {written} | erreurs: {errors}", type='warning')
         else:
             ui.notify(f"✅ Tags écrits pour {written} fichier(s)", type='positive')
 
-    def write_prompt_sidecar_files(tab='prompt'):
+    async def write_prompt_sidecar_files(tab='prompt'):
         sel_dict = getattr(state, f"sel_{tab}", {})
         selected_paths = [p for p, checked in sel_dict.items() if checked]
         if not selected_paths:
             return ui.notify('Sélectionnez au moins une image.', type='warning')
 
-        written = 0
-        errors = 0
-        for path in selected_paths:
-            try:
-                detailed = state.db_cache.get_detailed_prompt(path) or {}
-                basic = state.db_cache.get_prompt(path) or {}
-                text = str(detailed.get('text') or basic.get('text') or '').strip()
-                if not text:
-                    errors += 1
-                    continue
-                p = Path(path)
-                p.with_name(f"{p.stem}_prompt.txt").write_text(text, encoding='utf-8')
-                written += 1
-            except Exception as e:
-                errors += 1
-                state.add_log(f"[PROMPT] Erreur écriture TXT {path}: {e}")
+        ui.notify(f"💾 Écriture de {len(selected_paths):,} prompts TXT...", type='info', timeout=2000)
 
+        db_cache = state.db_cache
+
+        def _write_all():
+            written = 0
+            errors = 0
+            for path in selected_paths:
+                try:
+                    detailed = db_cache.get_detailed_prompt(path) or {}
+                    basic = db_cache.get_prompt(path) or {}
+                    text = str(detailed.get('text') or basic.get('text') or '').strip()
+                    if not text:
+                        errors += 1
+                        continue
+                    p = Path(path)
+                    p.with_name(f"{p.stem}_prompt.txt").write_text(text, encoding='utf-8')
+                    written += 1
+                except Exception as e:
+                    errors += 1
+                    state.add_log(f"[PROMPT] Erreur écriture TXT {path}: {e}")
+            return written, errors
+
+        written, errors = await run.io_bound(_write_all)
         if written:
             ui.notify(f"Prompts TXT écrits: {written}" + (f" | erreurs: {errors}" if errors else ''), type='positive' if errors == 0 else 'warning')
         else:
