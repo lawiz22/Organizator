@@ -4481,38 +4481,64 @@ def index_page():
 
     def delete_selected_media(tab='aes'):
         sel_dict = getattr(state, f"sel_{tab}")
-        selected_paths =[p for p, checked in sel_dict.items() if checked]
+        selected_paths = [p for p, checked in sel_dict.items() if checked]
         if not selected_paths:
             return ui.notify('Rien de sélectionné !', type='warning')
 
-        deleted = 0
-        errors = 0
-        deleted_set = set()
+        def _do_delete():
+            deleted = 0
+            errors = 0
+            deleted_set = set()
 
-        for path in selected_paths:
-            try:
-                if os.path.isfile(path):
-                    os.remove(path)
-                    deleted += 1
-                    deleted_set.add(path)
-                else:
+            for path in selected_paths:
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        deleted += 1
+                        deleted_set.add(path)
+                        # Supprimer les fichiers compagnons
+                        stem = os.path.splitext(path)[0]
+                        for companion_suffix in ('_validation.json', '_aesthetic.json', '.txt', '.json'):
+                            companion = stem + companion_suffix
+                            if os.path.isfile(companion):
+                                try:
+                                    os.remove(companion)
+                                except Exception as ec:
+                                    state.add_log(f"⚠️ Compagnon non supprimé {os.path.basename(companion)}: {ec}")
+                    else:
+                        errors += 1
+                        state.add_log(f"Suppression ignorée (introuvable): {path}")
+                except Exception as e:
                     errors += 1
-                    state.add_log(f"Suppression ignorée (introuvable): {path}")
-            except Exception as e:
-                errors += 1
-                state.add_log(f"Erreur suppression {path}: {e}")
+                    state.add_log(f"Erreur suppression {path}: {e}")
 
-        if deleted_set:
-            results_attr = _results_attr_name(tab)
-            setattr(state, results_attr, [i for i in getattr(state, results_attr) if i[1] not in deleted_set])
-            for p in deleted_set:
-                sel_dict[p] = False
-            _refresh_gallery(tab)
+            if deleted_set:
+                results_attr = _results_attr_name(tab)
+                setattr(state, results_attr, [i for i in getattr(state, results_attr) if i[1] not in deleted_set])
+                for p in deleted_set:
+                    sel_dict[p] = False
+                _refresh_gallery(tab)
 
-        if errors:
-            ui.notify(f"Supprimés: {deleted} | erreurs: {errors}", type='warning')
-        else:
-            ui.notify(f"{deleted} fichier(s) supprimé(s)", type='positive')
+            if errors:
+                ui.notify(f"Supprimés: {deleted} | erreurs: {errors}", type='warning')
+            else:
+                ui.notify(f"{deleted} fichier(s) + compagnons supprimé(s)", type='positive')
+
+        count = len(selected_paths)
+        with ui.dialog() as confirm_dlg, ui.card().classes('bg-gray-900 text-white'):
+            ui.label(f'⚠️ Supprimer {count} fichier(s) ?').classes('text-lg font-bold mb-1')
+            ui.label('Les fichiers compagnons (.txt, .json, _validation.json, _aesthetic.json) seront aussi supprimés.').classes('text-sm text-gray-400 mb-3')
+            with ui.row().classes('gap-2 mt-1'):
+                ui.button('Supprimer', icon='delete', on_click=lambda: (confirm_dlg.close(), _do_delete())).props('color=red')
+                ui.button('Annuler', on_click=confirm_dlg.close).props('outline color=white')
+        confirm_dlg.open()
+
+    def set_page_items(tab, value, page_paths):
+        """Sélectionner/désélectionner uniquement les items de la page courante."""
+        sel_dict = getattr(state, f"sel_{tab}")
+        for p in page_paths:
+            if p in sel_dict:
+                sel_dict[p] = value
 
     async def save_aesthetic_scores_action():
         """Écrit _aesthetic.json à côté de chaque image dans les résultats esthétiques."""
@@ -4710,17 +4736,23 @@ def index_page():
             state.search_page = 1
             search_gallery_ui.refresh()
 
+        _s_start = (state.search_page - 1) * ITEMS_PER_PAGE
+        _page_paths_search = [item[1] for item in filtered_results[_s_start:_s_start + ITEMS_PER_PAGE]]
+
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
-                    with ui.row().classes('gap-2 items-center'):
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Tout sélectionner', on_click=lambda: set_all('search', True)).props('outline color=white dense')
                         ui.button('Tout désélectionner', on_click=lambda: set_all('search', False)).props('outline color=white dense')
+                        ui.button('Sél. page', on_click=lambda pp=_page_paths_search: set_page_items('search', True, pp)).props('outline color=cyan dense')
+                        ui.button('Désél. page', on_click=lambda pp=_page_paths_search: set_page_items('search', False, pp)).props('outline color=cyan dense')
                         ui.toggle(['Tout', 'Images', 'Vidéos'], value=state.search_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('Export HTML', icon='html', on_click=lambda: export_html_action('search')).props('color=purple dense outline')
                         ui.button('Copier ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'search', chk_prefix_search.value)).props('color=blue dense')
                         ui.button('Déplacer ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'search', chk_prefix_search.value)).props('color=red dense')
+                        ui.button('Supprimer ✔', icon='delete', on_click=lambda: delete_selected_media('search')).props('color=red dense outline')
                 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -4786,12 +4818,17 @@ def index_page():
             state.aes_page = 1
             aesthetic_gallery_ui.refresh()
 
+        _s_start = (state.aes_page - 1) * ITEMS_PER_PAGE
+        _page_paths_aes = [item[1] for item in filtered_results[_s_start:_s_start + ITEMS_PER_PAGE]]
+
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
-                    with ui.row().classes('gap-2 items-center'):
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Tout sélectionner', on_click=lambda: set_all('aes', True)).props('outline color=white dense')
                         ui.button('Tout désélectionner', on_click=lambda: set_all('aes', False)).props('outline color=white dense')
+                        ui.button('Sél. page', on_click=lambda pp=_page_paths_aes: set_page_items('aes', True, pp)).props('outline color=cyan dense')
+                        ui.button('Désél. page', on_click=lambda pp=_page_paths_aes: set_page_items('aes', False, pp)).props('outline color=cyan dense')
                         ui.toggle(['Tout', 'Images', 'Vidéos'], value=state.aes_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('Export HTML', icon='html', on_click=lambda: export_html_action('aes')).props('color=purple dense outline')
@@ -4878,12 +4915,17 @@ def index_page():
             state.nsfw_page = 1
             nsfw_gallery_ui.refresh()
 
+        _s_start = (state.nsfw_page - 1) * ITEMS_PER_PAGE
+        _page_paths_nsfw = [item[1] for item in filtered_results[_s_start:_s_start + ITEMS_PER_PAGE]]
+
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
-                    with ui.row().classes('gap-2 items-center'):
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Tout sélectionner', on_click=lambda: set_all('nsfw', True)).props('outline color=white dense')
                         ui.button('Tout désélectionner', on_click=lambda: set_all('nsfw', False)).props('outline color=white dense')
+                        ui.button('Sél. page', on_click=lambda pp=_page_paths_nsfw: set_page_items('nsfw', True, pp)).props('outline color=cyan dense')
+                        ui.button('Désél. page', on_click=lambda pp=_page_paths_nsfw: set_page_items('nsfw', False, pp)).props('outline color=cyan dense')
                         ui.toggle(['Tout', 'Images', 'Vidéos'], value=state.nsfw_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                         def toggle_hide_sain(e):
                             state.nsfw_hide_sain = e.value
@@ -4982,6 +5024,7 @@ def index_page():
                         ui.button('💾 Modifier sélection', icon='edit', on_click=open_bulk_nsfw_modify_dialog).props('color=cyan dense outline').tooltip('Changer la catégorie NSFW de tous les médias sélectionnés')
                         ui.button('Copier ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'nsfw', chk_prefix_nsfw.value)).props('color=red-800 dense')
                         ui.button('Déplacer ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'nsfw', chk_prefix_nsfw.value)).props('color=red dense')
+                        ui.button('Supprimer ✔', icon='delete', on_click=lambda: delete_selected_media('nsfw')).props('color=red dense outline')
 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -5078,17 +5121,23 @@ def index_page():
             state.face_page = 1
             face_gallery_ui.refresh()
 
+        _s_start = (state.face_page - 1) * ITEMS_PER_PAGE
+        _page_paths_face = [item[1] for item in filtered_results[_s_start:_s_start + ITEMS_PER_PAGE]]
+
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
-                    with ui.row().classes('gap-2 items-center'):
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Tout sélectionner', on_click=lambda: set_all('face', True)).props('outline color=white dense')
                         ui.button('Tout désélectionner', on_click=lambda: set_all('face', False)).props('outline color=white dense')
+                        ui.button('Sél. page', on_click=lambda pp=_page_paths_face: set_page_items('face', True, pp)).props('outline color=cyan dense')
+                        ui.button('Désél. page', on_click=lambda pp=_page_paths_face: set_page_items('face', False, pp)).props('outline color=cyan dense')
                         ui.toggle(['Tout', 'Images', 'Vidéos'], value=state.face_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('Export HTML', icon='html', on_click=lambda: export_html_action('face')).props('color=purple dense outline')
                         ui.button('Copier ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'face', chk_prefix_face.value)).props('color=teal-800 dense')
                         ui.button('Déplacer ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'face', chk_prefix_face.value)).props('color=red dense')
+                        ui.button('Supprimer ✔', icon='delete', on_click=lambda: delete_selected_media('face')).props('color=red dense outline')
 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -5224,12 +5273,17 @@ def index_page():
 
         compact = bool(state.tags_compact)
 
+        _s_start = (state.tags_page - 1) * per_page
+        _page_paths_tags = [item[1] for item in filtered_results[_s_start:_s_start + per_page]]
+
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-3 pb-2 border-b border-gray-800 z-20 gap-2 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg'):
                     with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Tout sélectionner', on_click=lambda: set_all('tags', True)).props('outline color=white dense')
                         ui.button('Tout désélectionner', on_click=lambda: set_all('tags', False)).props('outline color=white dense')
+                        ui.button('Sél. page', on_click=lambda pp=_page_paths_tags: set_page_items('tags', True, pp)).props('outline color=cyan dense')
+                        ui.button('Désél. page', on_click=lambda pp=_page_paths_tags: set_page_items('tags', False, pp)).props('outline color=cyan dense')
                         ui.toggle(['Tout', 'Images', 'Vidéos'], value=state.tags_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                     with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Export HTML', icon='html', on_click=lambda: export_html_action('tags')).props('color=purple dense outline')
@@ -5237,6 +5291,7 @@ def index_page():
                         ui.button('Écrire JSON', icon='data_object', on_click=lambda: write_tags_sidecar_files('json', tags_threshold.value)).props('color=indigo dense outline')
                         ui.button('Copier ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=pink-800 dense')
                         ui.button('Déplacer ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=red dense')
+                        ui.button('Supprimer ✔', icon='delete', on_click=lambda: delete_selected_media('tags')).props('color=red dense outline')
 
                 with ui.row().classes('w-full items-center gap-2 flex-wrap'):
                     ui.input(placeholder='🔍 Rechercher nom / tag...', value=state.tags_search, on_change=apply_search).props('dense outlined clearable').classes('flex-1 min-w-[160px] bg-gray-800 rounded')
@@ -5372,18 +5427,24 @@ def index_page():
 
         compact = bool(state.prompt_compact)
 
+        _s_start = (state.prompt_page - 1) * per_page
+        _page_paths_prompt = [item[1] for item in filtered_results[_s_start:_s_start + per_page]]
+
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-3 pb-2 border-b border-gray-800 z-20 gap-2 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg'):
                     with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Tout sélectionner', on_click=lambda: set_all('prompt', True)).props('outline color=white dense')
                         ui.button('Tout désélectionner', on_click=lambda: set_all('prompt', False)).props('outline color=white dense')
+                        ui.button('Sél. page', on_click=lambda pp=_page_paths_prompt: set_page_items('prompt', True, pp)).props('outline color=cyan dense')
+                        ui.button('Désél. page', on_click=lambda pp=_page_paths_prompt: set_page_items('prompt', False, pp)).props('outline color=cyan dense')
                         ui.toggle(['Tout', 'Images', 'Vidéos'], value=state.prompt_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                     with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Export HTML', icon='html', on_click=lambda: export_html_action('prompt')).props('color=purple dense outline')
                         ui.button('📄 Prompts TXT', on_click=lambda: write_prompt_sidecar_files('prompt')).props('color=indigo dense outline')
                         ui.button('Copier ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'prompt', False, False)).props('color=teal-800 dense')
                         ui.button('Déplacer ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'prompt', False, False)).props('color=red dense')
+                        ui.button('Supprimer ✔', icon='delete', on_click=lambda: delete_selected_media('prompt')).props('color=red dense outline')
 
                 with ui.row().classes('w-full items-center gap-2 flex-wrap'):
                     ui.input(placeholder='🔍 Rechercher nom / prompt...', value=state.prompt_search, on_change=apply_search).props('dense outlined clearable').classes('flex-1 min-w-[160px] bg-gray-800 rounded')
