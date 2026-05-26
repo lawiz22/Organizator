@@ -1020,9 +1020,19 @@ class DatabaseCache:
         row = c.fetchone()
         if not row:
             return None
-        return {"source": row[0], "text": row[1]}
+        text = str(row[1] or '').strip()
+        # Auto-réparation : si garbage en DB, on le nettoie en place
+        if text and not TagEngine._is_valid_prompt_text(text):
+            c.execute("UPDATE prompt_cache SET prompt='' WHERE path=?", (path,))
+            self.conn.commit()
+            text = ''
+        return {"source": row[0], "text": text}
 
     def save_prompt(self, path, prompt_text, source="image_metadata"):
+        # Validation centrale : n'importe quel garbage est réduit à ''
+        prompt_text = str(prompt_text or '').strip()
+        if prompt_text and not TagEngine._is_valid_prompt_text(prompt_text):
+            prompt_text = ''
         c = self.conn.cursor()
         c.execute("SELECT source, prompt FROM prompt_cache WHERE path=?", (path,))
         existing = c.fetchone()
@@ -1052,9 +1062,19 @@ class DatabaseCache:
         row = c.fetchone()
         if not row:
             return None
-        return {"source": row[0], "text": row[1]}
+        text = str(row[1] or '').strip()
+        # Auto-réparation : si garbage en DB, on le nettoie en place
+        if text and not TagEngine._is_valid_prompt_text(text):
+            c.execute("UPDATE detailed_prompt_cache SET prompt='' WHERE path=?", (path,))
+            self.conn.commit()
+            text = ''
+        return {"source": row[0], "text": text}
 
     def save_detailed_prompt(self, path, prompt_text, source="heuristic"):
+        # Validation centrale : n'importe quel garbage est réduit à ''
+        prompt_text = str(prompt_text or '').strip()
+        if prompt_text and not TagEngine._is_valid_prompt_text(prompt_text):
+            prompt_text = ''
         c = self.conn.cursor()
         c.execute(
             "INSERT OR REPLACE INTO detailed_prompt_cache (path, source, prompt) VALUES (?, ?, ?)",
@@ -1229,13 +1249,16 @@ class DatabaseCache:
     def remove_paths(self, paths_to_remove):
         if not paths_to_remove: return
         c = self.conn.cursor()
-        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache', 'tags_cache']
+        tables = ['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache', 'tags_cache', 'prompt_cache', 'detailed_prompt_cache']
         chunk_size = 900
         for i in range(0, len(paths_to_remove), chunk_size):
             chunk = paths_to_remove[i:i+chunk_size]
             placeholders = ','.join(['?'] * len(chunk))
             for table in tables:
-                c.execute(f"DELETE FROM {table} WHERE path IN ({placeholders})", chunk)
+                try:
+                    c.execute(f"DELETE FROM {table} WHERE path IN ({placeholders})", chunk)
+                except Exception:
+                    pass
         self.conn.commit()
 
     def close(self): self.conn.close()
@@ -1440,7 +1463,7 @@ class SearchEngine:
         if files_list is None:
             self.log(f"Indexation du système de fichiers : {dir_path}...")
             all_supported = SUPPORTED_IMAGES + SUPPORTED_VIDEOS + SUPPORTED_TEXTS
-            files_list =[]
+            files_list = []
             for root, dirs, files in os.walk(dir_path):
                 if self.cancel_flag: break
                 for file in files:
@@ -1450,7 +1473,16 @@ class SearchEngine:
                 self.files_cache._data[dir_path] = files_list
                 self.files_cache.save_cache()
                 self.log(f"Fichiers supportés trouvés : {len(files_list)}")
-        return[f for f in files_list if f.lower().endswith(allowed_exts)]
+        else:
+            # Auto-guérison : retirer du cache les fichiers supprimés ou déplacés
+            existing = [f for f in files_list if os.path.isfile(f)]
+            if len(existing) < len(files_list):
+                removed = len(files_list) - len(existing)
+                self.log(f"[dir_cache] {removed} fichier(s) introuvable(s) retiré(s) du cache ({dir_path})")
+                self.files_cache._data[dir_path] = existing
+                self.files_cache.save_cache()
+                files_list = existing
+        return [f for f in files_list if f.lower().endswith(allowed_exts)]
 
     def _load_and_prep_file(self, file_path, phase='embedding'):
         ext = os.path.splitext(file_path)[1].lower()
@@ -2839,24 +2871,43 @@ class TagEngine:
         if comfy_like < max(1, len(node_values) // 2):
             return ""
 
-        # Strategy 1: find node whose _meta.title contains "positive" (not "negative")
+        # Build the set of negative node IDs from multiple signals
         negative_node_ids = set()
+
+        # Signal A: title-based detection (English + Chinese + French)
+        _neg_title_keywords = ('negative', 'neg ', 'neg_', 'bad prompt', 'unwanted',
+                               '负面', '负向', '反向', '不要', '坏')
         for node_id, node in data.items():
             if not isinstance(node, dict):
                 continue
             meta = node.get('_meta') or {}
             title = str(meta.get('title') or '').lower()
-            if 'negative' in title or title.startswith('neg'):
+            if any(kw in title for kw in _neg_title_keywords) or title.startswith('neg'):
                 negative_node_ids.add(str(node_id))
 
+        # Signal B: follow every KSampler's 'negative' input wire (language-independent)
+        for node_id, node in data.items():
+            if not isinstance(node, dict):
+                continue
+            class_type = str(node.get('class_type') or '').lower()
+            if 'sampler' in class_type or 'ksampler' in class_type:
+                inputs = node.get('inputs') or {}
+                neg_ref = inputs.get('negative')
+                if isinstance(neg_ref, list) and neg_ref:
+                    negative_node_ids.add(str(neg_ref[0]))
+
+        # Strategy 1: find node whose _meta.title contains "positive" (not "negative")
+        _pos_title_keywords = ('positive', 'pos ', 'pos_', 'prompt', '正向', '正面', '提示词')
         for node_id, node in data.items():
             if not isinstance(node, dict):
                 continue
             meta = node.get('_meta') or {}
             title = str(meta.get('title') or '').lower()
             inputs = node.get('inputs') or {}
-            text = str(inputs.get('text') or '').strip()
-            if text and 'positive' in title and str(node_id) not in negative_node_ids:
+            raw_text = inputs.get('text')
+            text = raw_text.strip() if isinstance(raw_text, str) else ''
+            if (text and str(node_id) not in negative_node_ids
+                    and any(kw in title for kw in _pos_title_keywords)):
                 return text
 
         # Strategy 2: follow KSampler's 'positive' input reference to source node
@@ -2871,8 +2922,9 @@ class TagEngine:
                     ref_id = str(positive_ref[0])
                     ref_node = data.get(ref_id) or {}
                     ref_inputs = ref_node.get('inputs') or {}
-                    text = str(ref_inputs.get('text') or '').strip()
-                    if text:
+                    raw_text = ref_inputs.get('text')
+                    text = raw_text.strip() if isinstance(raw_text, str) else ''
+                    if text and ref_id not in negative_node_ids:
                         return text
 
         # Strategy 3: first CLIPTextEncode node that is NOT a known negative node
@@ -2882,11 +2934,101 @@ class TagEngine:
             class_type = str(node.get('class_type') or '').lower()
             if 'clip' in class_type and 'encode' in class_type and str(node_id) not in negative_node_ids:
                 inputs = node.get('inputs') or {}
-                text = str(inputs.get('text') or '').strip()
+                raw_text = inputs.get('text')
+                text = raw_text.strip() if isinstance(raw_text, str) else ''
                 if text:
                     return text
 
         return ""
+
+    @staticmethod
+    def _is_valid_prompt_text(text: str) -> bool:
+        """Vérifie qu'un texte est un vrai prompt.
+        Rejette : chiffres seuls, listes Python, seeds, hashes hex (SHA/MD5/UUID),
+        valeurs techniques ComfyUI/SD, et les prompts négatifs purs.
+        """
+        t = text.strip()
+        if not t:
+            return False
+
+        # --- Blocklist des valeurs techniques ComfyUI / SD (jamais des prompts) ---
+        _TECH = {
+            'auto', 'image', 'latent', 'conditioning', 'mask', 'model', 'clip', 'vae',
+            'control_net', 'controlnet', 'string', 'int', 'float', 'boolean',
+            'none', 'null', 'true', 'false', 'undefined',
+            'euler', 'euler_ancestral', 'dpm', 'dpm2', 'lms', 'heun', 'ddpm', 'ddim',
+            'plms', 'unipc', 'karras', 'exponential', 'simple', 'linear', 'normal',
+            'empty', 'default', 'n/a', 'na', 'unknown',
+        }
+        if t.lower() in _TECH:
+            return False
+
+        # --- Rejeter les noms de fichiers modèle (single token avec extension) ---
+        _MODEL_EXTS = ('.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.gguf',
+                       '.onnx', '.sft', '.vae', '.lora')
+        t_lower_full = t.lower()
+        if ' ' not in t and ',' not in t and '\n' not in t:
+            if any(t_lower_full.endswith(ext) for ext in _MODEL_EXTS):
+                return False
+
+        # --- Rejeter le code Python / expressions (nœuds math ComfyUI) ---
+        _CODE_PATTERNS = (
+            'round(', 'int(', 'float(', 'str(', 'abs(', 'min(', 'max(',
+            'lambda ', 'def ', 'return ', 'import ', '== ', '!= ', '>= ', '<= ',
+        )
+        if len(t) < 120 and any(p in t_lower_full for p in _CODE_PATTERNS):
+            return False
+
+        # --- Rejeter les chaînes purement hexadécimales (SHA-1/256, MD5, UUID…) ---
+        hex_only = t.replace('-', '').replace('_', '').replace(' ', '').lower()
+        if len(hex_only) >= 8 and all(c in '0123456789abcdef' for c in hex_only):
+            return False
+
+        # --- Marqueurs de prompt négatif ---
+        # Forts (1 seul suffit pour rejeter)
+        _strong_neg_en = (
+            'worst quality', 'low quality', 'bad quality', 'normal quality',
+            'jpeg artifact', 'jpeg compress',
+            'bad anatomy', 'bad hands', 'bad feet', 'poorly drawn hands',
+            'extra fingers', 'fused fingers', 'missing fingers',
+            'extra limb', 'missing limb', 'missing arm', 'missing leg',
+            'disney pixar', 'pixar type',
+        )
+        _strong_neg_zh = (
+            '最差质量', '低质量', '丑陋', '畸形', '毁容', 'jpeg压缩',
+            '字幕', '水印', '模糊不清', '画得不好', '手指融合', '多余的手指',
+        )
+        t_lower = t.lower()
+        for kw in _strong_neg_en:
+            if kw in t_lower:
+                return False
+        for kw in _strong_neg_zh:
+            if kw in t:
+                return False
+
+        # Faibles (2+ requis pour rejeter — évite les faux positifs sur mots isolés)
+        _weak_neg = (
+            'blurry', 'blurred', 'out of focus', 'overexposed', 'underexposed',
+            'ugly', 'deformed', 'malformed', 'disfigured',
+            'watermark', 'text overlay', 'subtitle', 'cropped', 'duplicate',
+            'lowres', 'low res', 'pixelated', 'cartoon style',
+            '过曝', '整体发灰', '静止不动', '杂乱',
+        )
+        weak_hits = sum(1 for kw in _weak_neg if kw in t_lower)
+        weak_hits += sum(1 for kw in ('过曝', '整体发灰', '静止不动', '杂乱') if kw in t)
+        if weak_hits >= 2:
+            return False
+
+        # --- Doit contenir au moins 2 lettres consécutives ---
+        prev_alpha = False
+        for c in t:
+            if c.isalpha():
+                if prev_alpha:
+                    return True
+                prev_alpha = True
+            else:
+                prev_alpha = False
+        return False
 
     @staticmethod
     def _extract_positive_prompt_text(text: str) -> str:
@@ -2904,7 +3046,11 @@ class TagEngine:
         cleaned = normalized.strip()
         cleaned = cleaned.replace("\x00", " ")
         cleaned = "\n".join(line.strip() for line in cleaned.splitlines() if line.strip())
-        return cleaned[:12000]
+        result = cleaned[:12000]
+        # Rejeter les artefacts non-textuels (chiffres, listes Python, seeds, etc.)
+        if not TagEngine._is_valid_prompt_text(result):
+            return ""
+        return result
 
     @staticmethod
     def _prompt_text_to_tags(text: str) -> dict:
@@ -3007,6 +3153,7 @@ class TagEngine:
                     # ComfyUI keys: try dedicated extractor first (avoids picking up negative prompts)
                     if key_l in {"workflow", "prompt"}:
                         raw = value
+                        parsed_as_dict = False
                         if isinstance(raw, str):
                             raw = raw.strip()
                             if raw[:1] in '{[':
@@ -3015,15 +3162,17 @@ class TagEngine:
                                 except Exception:
                                     raw = value
                         if isinstance(raw, dict):
+                            parsed_as_dict = True
                             comfy_text = TagEngine._extract_comfyui_positive_prompt(raw)
-                            if comfy_text:
+                            if comfy_text and TagEngine._is_valid_prompt_text(comfy_text):
                                 return comfy_text
-                        # Fall back to generic for A1111-style plain text in prompt key
-                        if isinstance(value, str):
+                        # Fall back to generic ONLY if not a ComfyUI dict
+                        # (avoids harvesting model filenames, code, negative prompts from workflow)
+                        if not parsed_as_dict and isinstance(value, str):
                             candidates.extend(TagEngine._collect_prompt_strings(value))
                     elif key_l in {
                         "parameters", "comment", "description",
-                        "caption", "keywords", "xml:com.adobe.xmp", "exif",
+                        "caption", "keywords",
                     }:
                         candidates.extend(TagEngine._collect_prompt_strings(value))
 
@@ -3047,10 +3196,16 @@ class TagEngine:
                     pass
 
             for candidate in candidates:
+                stripped = str(candidate).strip()
                 # Skip raw JSON blobs that slipped through – not a usable prompt string
-                if str(candidate).strip()[:1] in '{[':
+                if stripped[:1] in '{[':
                     continue
-                prompt_text = TagEngine._extract_positive_prompt_text(candidate)
+                # Skip XMP/XML metadata blobs (Adobe, Dublin Core, RDF, etc.)
+                if stripped.startswith(('<?xpacket', '<x:xmpmeta', '<?xml', '<rdf:', '<dc:')):
+                    continue
+                if stripped.startswith('<') and 'xmlns:' in stripped[:500]:
+                    continue
+                prompt_text = TagEngine._extract_positive_prompt_text(stripped)
                 if prompt_text:
                     return prompt_text
             return ""
@@ -3523,10 +3678,19 @@ class AppState:
         self.prompt_search = ''
         self.tags_sort = 'score'
         self.prompt_sort = 'score'
+        self.aes_sort = 'score'
+        self.nsfw_sort = 'score'
         self.tags_per_page = 40
         self.prompt_per_page = 40
+        self.aes_per_page = 40
+        self.nsfw_per_page = 40
         self.tags_compact = False
         self.prompt_compact = False
+        self.aes_compact = False
+        self.nsfw_compact = False
+        self.aes_search = ''
+        self.nsfw_search = ''
+        self.aes_nsfw_filter_res = 'Tout'
         
         self.viewer_open = False
         self.viewer_items =[]
@@ -3984,7 +4148,7 @@ def index_page():
         prompt_debug_dialog.open()
 
     # --- LECTEUR PLEIN ECRAN ---
-    with ui.dialog().on('value', lambda e: setattr(state, 'viewer_open', e.value)).props('maximized transition-show=fade transition-hide=fade') as media_dialog:
+    with ui.dialog().on('hide', lambda: setattr(state, 'viewer_open', False)).props('maximized transition-show=fade transition-hide=fade') as media_dialog:
         with ui.element('div') \
             .classes('w-full h-full bg-black/95 p-0 flex flex-col relative items-center justify-center overflow-hidden') \
             .on('wheel.prevent', lambda e: change_media(1 if e.args['deltaY'] > 0 else -1),['deltaY']) \
@@ -4015,6 +4179,7 @@ def index_page():
         elif state.current_tab == 'NSFW' and path in state.sel_nsfw: is_selected = state.sel_nsfw[path]
         elif state.current_tab == 'Face' and path in state.sel_face: is_selected = state.sel_face[path]
         elif state.current_tab == 'Tags' and path in state.sel_tags: is_selected = state.sel_tags[path]
+        elif state.current_tab == 'Prompt' and path in state.sel_prompt: is_selected = state.sel_prompt[path]
             
         btn_viewer_select._props['icon'] = 'check_box' if is_selected else 'check_box_outline_blank'
         btn_viewer_select._props['color'] = 'green' if is_selected else 'white'
@@ -4033,6 +4198,8 @@ def index_page():
             state.sel_face[path] = not state.sel_face[path]
         elif state.current_tab == 'Tags' and path in state.sel_tags:
             state.sel_tags[path] = not state.sel_tags[path]
+        elif state.current_tab == 'Prompt' and path in state.sel_prompt:
+            state.sel_prompt[path] = not state.sel_prompt[path]
         update_viewer_selection_ui()
 
     def download_current_item():
@@ -4094,6 +4261,7 @@ def index_page():
             return
         state.viewer_items = list(items)
         state.viewer_index = max(0, min(len(state.viewer_items) - 1, int(index)))
+        state.viewer_open = True
         render_viewer()
         media_dialog.open()
         
@@ -4516,7 +4684,26 @@ def index_page():
                 results_attr = _results_attr_name(tab)
                 setattr(state, results_attr, [i for i in getattr(state, results_attr) if i[1] not in deleted_set])
                 for p in deleted_set:
-                    sel_dict[p] = False
+                    sel_dict.pop(p, None)
+                # Nettoyer les caches DB (toutes les tables)
+                try:
+                    search_engine.db_cache.remove_paths(list(deleted_set))
+                except Exception as e:
+                    state.add_log(f"⚠️ Cache DB non nettoyé: {e}")
+                # Nettoyer dir_cache.json (liste de fichiers)
+                try:
+                    deleted_norm = {os.path.normcase(p) for p in deleted_set}
+                    for dir_key in list(search_engine.files_cache._data.keys()):
+                        search_engine.files_cache._data[dir_key] = [
+                            f for f in search_engine.files_cache._data[dir_key]
+                            if os.path.normcase(f) not in deleted_norm
+                        ]
+                    search_engine.files_cache.save_cache()
+                except Exception as e:
+                    state.add_log(f"⚠️ dir_cache non nettoyé: {e}")
+                # Nettoyer le cache NSFW en mémoire
+                for p in deleted_set:
+                    _nsfw_tier_cache.pop(p, None)
                 _refresh_gallery(tab)
 
             if errors:
@@ -4799,14 +4986,30 @@ def index_page():
         if not state.aesthetic_results:
             return ui.label("Les meilleures photos/vidéos apparaîtront ici...").classes("text-gray-400 m-4")
 
-        filtered_results =[]
+        search_q = str(state.aes_search or '').strip().lower()
+        filtered_results = []
         for item in state.aesthetic_results:
             p = item[1].lower()
             if state.aes_res_filter == 'Images' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.aes_res_filter == 'Vidéos' and not p.endswith(SUPPORTED_VIDEOS): continue
+            if state.aes_nsfw_filter_res != 'Tout':
+                tier = _read_nsfw_tier(item[1])
+                if state.aes_nsfw_filter_res == 'Non validé' and tier != '': continue
+                elif state.aes_nsfw_filter_res != 'Non validé' and tier.capitalize() != state.aes_nsfw_filter_res: continue
+            if search_q:
+                name = os.path.basename(item[1]).lower()
+                if search_q not in name: continue
             filtered_results.append(item)
 
-        total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        if state.aes_sort == 'name_asc':
+            filtered_results.sort(key=lambda x: os.path.basename(x[1]).lower())
+        elif state.aes_sort == 'name_desc':
+            filtered_results.sort(key=lambda x: os.path.basename(x[1]).lower(), reverse=True)
+        elif state.aes_sort == 'score_asc':
+            filtered_results.sort(key=lambda x: x[0])
+
+        per_page = int(state.aes_per_page or 40)
+        total_pages = max(1, (len(filtered_results) + per_page - 1) // per_page)
         if state.aes_page > total_pages: state.aes_page = 1
 
         def change_page(d):
@@ -4818,73 +5021,128 @@ def index_page():
             state.aes_page = 1
             aesthetic_gallery_ui.refresh()
 
-        _s_start = (state.aes_page - 1) * ITEMS_PER_PAGE
-        _page_paths_aes = [item[1] for item in filtered_results[_s_start:_s_start + ITEMS_PER_PAGE]]
+        def apply_nsfw_filter_aes(e):
+            state.aes_nsfw_filter_res = e.value
+            state.aes_page = 1
+            aesthetic_gallery_ui.refresh()
+
+        def apply_search(e):
+            state.aes_search = str(e.value or '')
+            state.aes_page = 1
+            aesthetic_gallery_ui.refresh()
+
+        def apply_sort(e):
+            state.aes_sort = str(e.value or 'score')
+            state.aes_page = 1
+            aesthetic_gallery_ui.refresh()
+
+        def apply_per_page(e):
+            state.aes_per_page = int(e.value or 40)
+            state.aes_page = 1
+            aesthetic_gallery_ui.refresh()
+
+        compact = bool(state.aes_compact)
+
+        _s_start = (state.aes_page - 1) * per_page
+        _page_paths_aes = [item[1] for item in filtered_results[_s_start:_s_start + per_page]]
 
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
-            with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
-                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
+            with ui.column().classes('w-full shrink-0 bg-gray-900 p-3 pb-2 border-b border-gray-800 z-20 gap-2 shadow-md'):
+                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg'):
                     with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Tout sélectionner', on_click=lambda: set_all('aes', True)).props('outline color=white dense')
                         ui.button('Tout désélectionner', on_click=lambda: set_all('aes', False)).props('outline color=white dense')
                         ui.button('Sél. page', on_click=lambda pp=_page_paths_aes: set_page_items('aes', True, pp)).props('outline color=cyan dense')
                         ui.button('Désél. page', on_click=lambda pp=_page_paths_aes: set_page_items('aes', False, pp)).props('outline color=cyan dense')
                         ui.toggle(['Tout', 'Images', 'Vidéos'], value=state.aes_res_filter, on_change=apply_filter).classes('text-xs ml-2')
-                    with ui.row().classes('gap-2 items-center'):
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Export HTML', icon='html', on_click=lambda: export_html_action('aes')).props('color=purple dense outline')
                         ui.button('💾 Sauver ✔', on_click=save_aesthetic_scores_action).props('color=teal dense outline').tooltip('Écrire _aesthetic.json à côté de chaque image sélectionnée (ou tous si rien sélectionné)')
                         ui.button('Copier ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'aes', chk_prefix_aes.value)).props('color=yellow-800 dense')
                         ui.button('Déplacer ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'aes', chk_prefix_aes.value)).props('color=red dense')
                         ui.button('Supprimer ✔', icon='delete', on_click=lambda: delete_selected_media('aes')).props('color=red dense outline')
 
+                with ui.row().classes('w-full items-center gap-2 flex-wrap'):
+                    ui.input(placeholder='🔍 Rechercher nom...', value=state.aes_search, on_change=apply_search).props('dense outlined clearable').classes('flex-1 min-w-[160px] bg-gray-800 rounded')
+                    ui.select({'score': '↓ Score', 'score_asc': '↑ Score', 'name_asc': 'A→Z', 'name_desc': 'Z→A'}, value=state.aes_sort, label='Tri', on_change=apply_sort).props('dense outlined').classes('w-32')
+                    ui.select({20: '20/page', 40: '40/page', 100: '100/page'}, value=per_page, label='Par page', on_change=apply_per_page).props('dense outlined').classes('w-28')
+                    ui.select(
+                        {'Tout': '🔵 Tout', 'Sain': '✅ Sain', 'Sensuel': '⚡ Sensuel', 'Explicit': '🔞 Explicit', 'Non validé': '? Non validé'},
+                        value=state.aes_nsfw_filter_res, label='NSFW', on_change=apply_nsfw_filter_aes,
+                    ).props('dense outlined').classes('w-28').tooltip('Filtrer par validation NSFW')
+                    ui.button(icon='grid_view' if not compact else 'view_module', on_click=lambda: (setattr(state, 'aes_compact', not state.aes_compact), aesthetic_gallery_ui.refresh())).props('flat round dense color=white').tooltip('Basculer vue compacte')
+                    ui.label(f'{len(filtered_results)} résultat(s)').classes('text-xs text-gray-400 ml-1')
+
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
-                    ui.label(f'Page {state.aes_page} / {total_pages}').classes('text-gray-300 font-bold')
+                    ui.label(f'Page {state.aes_page} / {total_pages} ({len(filtered_results)} items)').classes('text-gray-300 font-bold text-sm')
                     ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
 
             scroll_id = 'aes_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
-                start_idx = (state.aes_page - 1) * ITEMS_PER_PAGE
-                page_items = filtered_results[start_idx : start_idx + ITEMS_PER_PAGE]
-                all_paths =[p for a, p, m in filtered_results]
+                start_idx = (state.aes_page - 1) * per_page
+                page_items = filtered_results[start_idx : start_idx + per_page]
+                all_paths = [p for a, p, m in filtered_results]
 
                 if not page_items:
                     ui.label("Aucun fichier pour le filtre sélectionné.").classes("text-gray-400 m-4")
 
-                with ui.grid(columns=int(state.grid_columns)).classes('w-full gap-6 pb-10'):
+                cols = int(state.grid_columns) + (3 if compact else 0)
+                gap_cls = 'w-full gap-1 pb-10' if compact else 'w-full gap-6 pb-10'
+                with ui.grid(columns=cols).classes(gap_cls):
                     for avg_score, path, max_score in page_items:
                         safe_path = urllib.parse.quote(path)
                         global_index = all_paths.index(path)
                         is_video = path.lower().endswith(SUPPORTED_VIDEOS)
                         aes_info = aesthetic_explain(avg_score, max_score, is_video) if state.aes_scan_mode == 'score' else None
-                        
-                        with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-yellow-500 transition-colors p-0 overflow-hidden relative'):
-                            with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                ui.checkbox().bind_value(state.sel_aes, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'aes'),['shiftKey'])
+                        nsfw_tier = _read_nsfw_tier(path)
+                        card_bdr = f'border-2 {_NSFW_CARD_BORDER[nsfw_tier]}' if nsfw_tier else 'border border-gray-700'
 
-                            with ui.context_menu():
-                                ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
-                                ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
-                                ui.menu_item('Ouvrir le dossier', on_click=lambda p=path: reveal_file_native(p))
-
-                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
-                            
-                            with ui.row().classes('w-full justify-between items-center p-2'):
+                        if compact:
+                            with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-yellow-500 transition-colors p-0 overflow-hidden relative'):
+                                with ui.row().classes('absolute top-1 left-1 bg-black/70 rounded px-0.5 z-10'):
+                                    ui.checkbox().bind_value(state.sel_aes, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'aes'), ['shiftKey']).props('dense size=xs')
+                                if nsfw_tier:
+                                    lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
+                                    ui.label(lbl).classes(f'absolute top-1 right-1 text-[8px] font-bold px-1 rounded border {cls} z-10')
+                                with ui.context_menu():
+                                    ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
+                                    ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                    ui.menu_item('Ouvrir le dossier', on_click=lambda p=path: reveal_file_native(p))
+                                ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                                 if state.aes_scan_mode == 'blur':
-                                    ui.label(f"🌫 Netteté: {avg_score:.0f}").classes('text-orange-400 font-bold text-lg')
+                                    ui.label(f"🌫 {avg_score:.0f}").classes('text-[9px] text-orange-400 px-1 pb-0.5 truncate w-full')
                                 else:
-                                    ui.label(f"★ {avg_score:.2f} ({aes_info['avg_pct']:.0f}%)").classes('text-yellow-400 font-bold text-lg')
-                                    if avg_score != max_score:
-                                        ui.label(f"Pic: {max_score:.2f} ({aes_info['max_pct']:.0f}%)").classes('text-xs text-gray-500')
+                                    ui.label(f"★ {avg_score:.2f} ({aes_info['avg_pct']:.0f}%)").classes('text-[9px] text-yellow-400 px-1 pb-0.5 truncate w-full')
+                        else:
+                            with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-yellow-500 transition-colors p-0 overflow-hidden relative'):
+                                with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                    ui.checkbox().bind_value(state.sel_aes, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'aes'), ['shiftKey'])
+                                if nsfw_tier:
+                                    lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
+                                    ui.label(lbl).classes(f'absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded border {cls} z-10')
+                                with ui.context_menu():
+                                    ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
+                                    ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                    ui.menu_item('Ouvrir le dossier', on_click=lambda p=path: reveal_file_native(p))
+                                ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
 
-                            if state.aes_scan_mode == 'score':
-                                with ui.expansion('Pourquoi ce score', icon='help_outline').classes('w-full px-2 pb-1 text-xs text-gray-300'):
-                                    ui.label(f"Niveau: {aes_info['level']} ({aes_info['avg_pct']:.0f}%)").classes('text-yellow-300')
-                                    ui.label(f"Méthode: {aes_info['method']}").classes('text-gray-300')
-                                    if is_video:
-                                        ui.label(f"Stabilité visuelle: {aes_info['stability']} (écart pic/moyenne: {aes_info['delta']:.1f}%)").classes('text-gray-400')
+                                with ui.row().classes('w-full justify-between items-center p-2'):
+                                    if state.aes_scan_mode == 'blur':
+                                        ui.label(f"🌫 Netteté: {avg_score:.0f}").classes('text-orange-400 font-bold text-lg')
+                                    else:
+                                        ui.label(f"★ {avg_score:.2f} ({aes_info['avg_pct']:.0f}%)").classes('text-yellow-400 font-bold text-lg')
+                                        if avg_score != max_score:
+                                            ui.label(f"Pic: {max_score:.2f} ({aes_info['max_pct']:.0f}%)").classes('text-xs text-gray-500')
 
-                            ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
+                                if state.aes_scan_mode == 'score':
+                                    with ui.expansion('Pourquoi ce score', icon='help_outline').classes('w-full px-2 pb-1 text-xs text-gray-300'):
+                                        ui.label(f"Niveau: {aes_info['level']} ({aes_info['avg_pct']:.0f}%)").classes('text-yellow-300')
+                                        ui.label(f"Méthode: {aes_info['method']}").classes('text-gray-300')
+                                        if is_video:
+                                            ui.label(f"Stabilité visuelle: {aes_info['stability']} (écart pic/moyenne: {aes_info['delta']:.1f}%)").classes('text-gray-400')
+
+                                ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
 
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=yellow-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Haut de page')
 
@@ -4893,6 +5151,7 @@ def index_page():
         if not state.nsfw_results:
             return ui.label("Les résultats de l'analyse NSFW apparaîtront ici...").classes("text-gray-400 m-4")
 
+        search_q = str(state.nsfw_search or '').strip().lower()
         filtered_results = []
         for item in state.nsfw_results:
             p = item[1].lower()
@@ -4901,9 +5160,18 @@ def index_page():
             if state.nsfw_hide_sain and item[2] == 'SAIN': continue
             if state.nsfw_hide_sensuel and item[2] == 'SENSUEL': continue
             if state.nsfw_hide_explicite and item[2] == 'EXPLICITE': continue
+            if search_q:
+                name = os.path.basename(item[1]).lower()
+                if search_q not in name: continue
             filtered_results.append(item)
 
-        total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        if state.nsfw_sort == 'name_asc':
+            filtered_results.sort(key=lambda x: os.path.basename(x[1]).lower())
+        elif state.nsfw_sort == 'name_desc':
+            filtered_results.sort(key=lambda x: os.path.basename(x[1]).lower(), reverse=True)
+
+        per_page = int(state.nsfw_per_page or 40)
+        total_pages = max(1, (len(filtered_results) + per_page - 1) // per_page)
         if state.nsfw_page > total_pages: state.nsfw_page = 1
 
         def change_page(d):
@@ -4915,12 +5183,29 @@ def index_page():
             state.nsfw_page = 1
             nsfw_gallery_ui.refresh()
 
-        _s_start = (state.nsfw_page - 1) * ITEMS_PER_PAGE
-        _page_paths_nsfw = [item[1] for item in filtered_results[_s_start:_s_start + ITEMS_PER_PAGE]]
+        def apply_search(e):
+            state.nsfw_search = str(e.value or '')
+            state.nsfw_page = 1
+            nsfw_gallery_ui.refresh()
+
+        def apply_sort(e):
+            state.nsfw_sort = str(e.value or 'score')
+            state.nsfw_page = 1
+            nsfw_gallery_ui.refresh()
+
+        def apply_per_page(e):
+            state.nsfw_per_page = int(e.value or 40)
+            state.nsfw_page = 1
+            nsfw_gallery_ui.refresh()
+
+        compact = bool(state.nsfw_compact)
+
+        _s_start = (state.nsfw_page - 1) * per_page
+        _page_paths_nsfw = [item[1] for item in filtered_results[_s_start:_s_start + per_page]]
 
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
-            with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
-                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
+            with ui.column().classes('w-full shrink-0 bg-gray-900 p-3 pb-2 border-b border-gray-800 z-20 gap-2 shadow-md'):
+                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg'):
                     with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Tout sélectionner', on_click=lambda: set_all('nsfw', True)).props('outline color=white dense')
                         ui.button('Tout désélectionner', on_click=lambda: set_all('nsfw', False)).props('outline color=white dense')
@@ -5018,7 +5303,7 @@ def index_page():
 
                         bulk_dialog.open()
 
-                    with ui.row().classes('gap-2 items-center'):
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Export HTML', icon='html', on_click=lambda: export_html_action('nsfw')).props('color=purple dense outline')
                         ui.button('Écrire contrats JSON', icon='assignment_turned_in', on_click=lambda: write_nsfw_contracts_action()).props('color=teal dense outline')
                         ui.button('💾 Modifier sélection', icon='edit', on_click=open_bulk_nsfw_modify_dialog).props('color=cyan dense outline').tooltip('Changer la catégorie NSFW de tous les médias sélectionnés')
@@ -5026,21 +5311,30 @@ def index_page():
                         ui.button('Déplacer ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'nsfw', chk_prefix_nsfw.value)).props('color=red dense')
                         ui.button('Supprimer ✔', icon='delete', on_click=lambda: delete_selected_media('nsfw')).props('color=red dense outline')
 
+                with ui.row().classes('w-full items-center gap-2 flex-wrap'):
+                    ui.input(placeholder='🔍 Rechercher nom...', value=state.nsfw_search, on_change=apply_search).props('dense outlined clearable').classes('flex-1 min-w-[160px] bg-gray-800 rounded')
+                    ui.select({'score': '↓ Score', 'name_asc': 'A→Z', 'name_desc': 'Z→A'}, value=state.nsfw_sort, label='Tri', on_change=apply_sort).props('dense outlined').classes('w-28')
+                    ui.select({20: '20/page', 40: '40/page', 100: '100/page'}, value=per_page, label='Par page', on_change=apply_per_page).props('dense outlined').classes('w-28')
+                    ui.button(icon='grid_view' if not compact else 'view_module', on_click=lambda: (setattr(state, 'nsfw_compact', not state.nsfw_compact), nsfw_gallery_ui.refresh())).props('flat round dense color=white').tooltip('Basculer vue compacte')
+                    ui.label(f'{len(filtered_results)} résultat(s)').classes('text-xs text-gray-400 ml-1')
+
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
-                    ui.label(f'Page {state.nsfw_page} / {total_pages}').classes('text-gray-300 font-bold')
+                    ui.label(f'Page {state.nsfw_page} / {total_pages} ({len(filtered_results)} items)').classes('text-gray-300 font-bold text-sm')
                     ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
 
             scroll_id = 'nsfw_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
-                start_idx = (state.nsfw_page - 1) * ITEMS_PER_PAGE
-                page_items = filtered_results[start_idx : start_idx + ITEMS_PER_PAGE]
-                all_paths =[p for d, p, l, dt in filtered_results]
+                start_idx = (state.nsfw_page - 1) * per_page
+                page_items = filtered_results[start_idx : start_idx + per_page]
+                all_paths = [p for d, p, l, dt in filtered_results]
 
                 if not page_items:
                     ui.label("Aucun fichier pour le filtre sélectionné.").classes("text-gray-400 m-4")
 
-                with ui.grid(columns=int(state.grid_columns)).classes('w-full gap-6 pb-10'):
+                cols = int(state.grid_columns) + (3 if compact else 0)
+                gap_cls = 'w-full gap-1 pb-10' if compact else 'w-full gap-6 pb-10'
+                with ui.grid(columns=cols).classes(gap_cls):
                     for danger_score, path, tier, details in page_items:
                         safe_path = urllib.parse.quote(path)
                         global_index = all_paths.index(path)
@@ -5062,38 +5356,51 @@ def index_page():
                             badge_cls    = 'bg-green-900 text-green-300'
                             badge_icon   = '🟢'
 
-                        with ui.card().classes(f'bg-gray-800 border-2 {card_border} transition-colors p-0 overflow-hidden relative'):
-                            with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                ui.checkbox().bind_value(state.sel_nsfw, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'nsfw'), ['shiftKey'])
+                        if compact:
+                            with ui.card().classes(f'bg-gray-800 border-2 {card_border} transition-colors p-0 overflow-hidden relative'):
+                                with ui.row().classes('absolute top-1 left-1 bg-black/70 rounded px-0.5 z-10'):
+                                    ui.checkbox().bind_value(state.sel_nsfw, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'nsfw'), ['shiftKey']).props('dense size=xs')
+                                with ui.context_menu():
+                                    ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
+                                    ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                    ui.menu_item('Ouvrir le dossier', on_click=lambda p=path: reveal_file_native(p))
+                                ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                                with ui.row().classes('w-full items-center justify-between px-1 pb-0.5 gap-1'):
+                                    ui.label(f"{badge_icon} {danger_score*100:.0f}%").classes(f'{score_color} text-[9px] font-bold truncate flex-1')
+                                    ui.label(os.path.basename(path)).classes('text-[9px] text-gray-400 truncate flex-1').tooltip(path)
+                        else:
+                            with ui.card().classes(f'bg-gray-800 border-2 {card_border} transition-colors p-0 overflow-hidden relative'):
+                                with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                    ui.checkbox().bind_value(state.sel_nsfw, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'nsfw'), ['shiftKey'])
 
-                            with ui.context_menu():
-                                ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
-                                ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
-                                ui.menu_item('Ouvrir le dossier', on_click=lambda p=path: reveal_file_native(p))
+                                with ui.context_menu():
+                                    ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
+                                    ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                    ui.menu_item('Ouvrir le dossier', on_click=lambda p=path: reveal_file_native(p))
 
-                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                                ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
 
-                            with ui.row().classes('w-full items-center justify-between px-2 pt-2 pb-1 gap-1'):
-                                ui.label(f"{danger_score*100:.1f}%").classes(f'{score_color} font-bold text-lg')
-                                ui.label(f"{badge_icon} {tier}").classes(f'{badge_cls} text-xs font-bold px-2 py-0.5 rounded')
+                                with ui.row().classes('w-full items-center justify-between px-2 pt-2 pb-1 gap-1'):
+                                    ui.label(f"{danger_score*100:.1f}%").classes(f'{score_color} font-bold text-lg')
+                                    ui.label(f"{badge_icon} {tier}").classes(f'{badge_cls} text-xs font-bold px-2 py-0.5 rounded')
 
-                            # Colored label chips — actual raw model labels
-                            top_scores = sorted([(lbl, prob) for lbl, prob in details.items() if not lbl.startswith('_')], key=lambda x: x[1], reverse=True)[:4]
-                            with ui.row().classes('w-full flex-wrap gap-1 px-2 pb-1'):
-                                for lbl, prob in top_scores:
-                                    if lbl.lower() in NSFW_SENSUAL_LABELS:
-                                        chip = 'bg-yellow-900 text-yellow-300 border border-yellow-700'
-                                    elif lbl.lower() in NSFW_SAFE_LABELS:
-                                        chip = 'bg-green-900 text-green-300 border border-green-800'
-                                    else:
-                                        chip = 'bg-red-900 text-red-300 border border-red-800'
-                                    ui.label(f"{lbl}: {prob*100:.0f}%").classes(f'{chip} text-xs px-1.5 py-0 rounded font-mono leading-5')
+                                # Colored label chips — actual raw model labels
+                                top_scores = sorted([(lbl, prob) for lbl, prob in details.items() if not lbl.startswith('_')], key=lambda x: x[1], reverse=True)[:4]
+                                with ui.row().classes('w-full flex-wrap gap-1 px-2 pb-1'):
+                                    for lbl, prob in top_scores:
+                                        if lbl.lower() in NSFW_SENSUAL_LABELS:
+                                            chip = 'bg-yellow-900 text-yellow-300 border border-yellow-700'
+                                        elif lbl.lower() in NSFW_SAFE_LABELS:
+                                            chip = 'bg-green-900 text-green-300 border border-green-800'
+                                        else:
+                                            chip = 'bg-red-900 text-red-300 border border-red-800'
+                                        ui.label(f"{lbl}: {prob*100:.0f}%").classes(f'{chip} text-xs px-1.5 py-0 rounded font-mono leading-5')
 
-                            ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-1 truncate w-full').tooltip(path)
-                            
-                            # Bouton pour modifier la catégorie manuellement
-                            with ui.row().classes('w-full px-2 pb-2 gap-1'):
-                                ui.button('✏️ Modifier', on_click=lambda p=path, t=tier: modify_nsfw_category(p, t)).classes('flex-1 bg-blue-700 hover:bg-blue-600 text-xs py-1').tooltip('Corriger la catégorie si l\'IA s\'est trompée')
+                                ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-1 truncate w-full').tooltip(path)
+
+                                # Bouton pour modifier la catégorie manuellement
+                                with ui.row().classes('w-full px-2 pb-2 gap-1'):
+                                    ui.button('✏️ Modifier', on_click=lambda p=path, t=tier: modify_nsfw_category(p, t)).classes('flex-1 bg-blue-700 hover:bg-blue-600 text-xs py-1').tooltip('Corriger la catégorie si l\'IA s\'est trompée')
 
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=red-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Haut de page')
 
@@ -5200,10 +5507,19 @@ def index_page():
         return tier
 
     _NSFW_BADGE = {
-        'SAIN':     ('✅ SAIN',    'text-green-400  bg-green-900/40  border-green-700'),
-        'SENSUEL':  ('⚡ SENSUEL', 'text-yellow-300 bg-yellow-900/40 border-yellow-700'),
-        'EXPLICIT': ('🔞 EXPLICIT','text-red-400    bg-red-900/40    border-red-700'),
-        '':         ('? N/V',       'text-gray-500   bg-gray-800/60   border-gray-600'),
+        'SAIN':      ('✅ SAIN',     'text-green-400  bg-green-900/40  border-green-700'),
+        'SENSUEL':   ('⚡ SENSUEL',  'text-yellow-300 bg-yellow-900/40 border-yellow-700'),
+        'EXPLICIT':  ('🔞 EXPLICIT', 'text-red-400    bg-red-900/40    border-red-700'),
+        'EXPLICITE': ('🔞 EXPLICIT', 'text-red-400    bg-red-900/40    border-red-700'),
+        '':          ('? N/V',       'text-gray-500   bg-gray-800/60   border-gray-600'),
+    }
+
+    # Couleur de bordure de carte selon le tier NSFW
+    _NSFW_CARD_BORDER = {
+        'SAIN':      'border-green-700',
+        'SENSUEL':   'border-yellow-500',
+        'EXPLICIT':  'border-red-600',
+        'EXPLICITE': 'border-red-600',
     }
 
     def _nsfw_badge_ui(tier: str):
@@ -5327,9 +5643,10 @@ def index_page():
                         top_tags = sorted(tags_dict.items(), key=lambda x: x[1], reverse=True)[:3]
                         top_tags_str = ", ".join([f"{k}" for k, v in top_tags])
                         nsfw_tier = _read_nsfw_tier(path)
+                        card_bdr = f'border-2 {_NSFW_CARD_BORDER[nsfw_tier]}' if nsfw_tier else 'border border-gray-700'
 
                         if compact:
-                            with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-pink-500 transition-colors p-0 overflow-hidden relative'):
+                            with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-pink-500 transition-colors p-0 overflow-hidden relative'):
                                 with ui.row().classes('absolute top-1 left-1 bg-black/70 rounded px-0.5 z-10'):
                                     ui.checkbox().bind_value(state.sel_tags, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'tags'), ['shiftKey']).props('dense size=xs')
                                 if nsfw_tier:
@@ -5342,7 +5659,7 @@ def index_page():
                                 ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                                 ui.label(os.path.basename(path)).classes('text-[9px] text-gray-400 px-1 pb-0.5 truncate w-full').tooltip(path)
                         else:
-                            with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-pink-500 transition-colors p-0 overflow-hidden relative'):
+                            with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-pink-500 transition-colors p-0 overflow-hidden relative'):
                                 with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                     ui.checkbox().bind_value(state.sel_tags, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'tags'), ['shiftKey'])
                                 if nsfw_tier:
@@ -5373,6 +5690,13 @@ def index_page():
             p = item[1].lower()
             prompt_text = str(item[2] or '').strip()
             detailed_text = str(item[3] or '').strip()
+            # Validation runtime : si garbage en mémoire, on l'ignore pour l'affichage
+            if prompt_text and not TagEngine._is_valid_prompt_text(prompt_text):
+                prompt_text = ''
+            if detailed_text and not TagEngine._is_valid_prompt_text(detailed_text):
+                detailed_text = ''
+            # Réécrire l'item avec les valeurs nettoyées pour que les cartes utilisent les bonnes
+            item = (item[0], item[1], prompt_text, detailed_text, item[4], item[5])
             if state.prompt_res_filter == 'Images' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.prompt_res_filter == 'Vidéos' and not p.endswith(SUPPORTED_VIDEOS): continue
             if state.prompt_hide_with_prompt and (prompt_text or detailed_text): continue
@@ -5391,6 +5715,10 @@ def index_page():
             filtered_results.sort(key=lambda x: os.path.basename(x[1]).lower())
         elif state.prompt_sort == 'name_desc':
             filtered_results.sort(key=lambda x: os.path.basename(x[1]).lower(), reverse=True)
+        elif state.prompt_sort == 'score_asc':
+            filtered_results.sort(key=lambda x: x[0])
+        else:  # 'score' — score descendant (défaut)
+            filtered_results.sort(key=lambda x: x[0], reverse=True)
 
         per_page = int(state.prompt_per_page or 40)
         total_pages = max(1, (len(filtered_results) + per_page - 1) // per_page)
@@ -5448,7 +5776,7 @@ def index_page():
 
                 with ui.row().classes('w-full items-center gap-2 flex-wrap'):
                     ui.input(placeholder='🔍 Rechercher nom / prompt...', value=state.prompt_search, on_change=apply_search).props('dense outlined clearable').classes('flex-1 min-w-[160px] bg-gray-800 rounded')
-                    ui.select({'score': '↓ Score', 'name_asc': 'A→Z', 'name_desc': 'Z→A'}, value=state.prompt_sort, label='Tri', on_change=apply_sort).props('dense outlined').classes('w-28')
+                    ui.select({'score': '↓ Score', 'score_asc': '↑ Score', 'name_asc': 'A→Z', 'name_desc': 'Z→A'}, value=state.prompt_sort, label='Tri', on_change=apply_sort).props('dense outlined').classes('w-28')
                     ui.select({20: '20/page', 40: '40/page', 100: '100/page'}, value=per_page, label='Par page', on_change=apply_per_page).props('dense outlined').classes('w-28')
                     ui.select(
                         {'Tout': '🔵 Tout', 'Sain': '✅ Sain', 'Sensuel': '⚡ Sensuel', 'Explicit': '🔞 Explicit', 'Non validé': '? Non validé'},
@@ -5479,9 +5807,10 @@ def index_page():
                         global_index = all_paths.index(path)
                         preview = (prompt_text or detailed_prompt_text or '').strip()
                         nsfw_tier = _read_nsfw_tier(path)
+                        card_bdr = f'border-2 {_NSFW_CARD_BORDER[nsfw_tier]}' if nsfw_tier else 'border border-gray-700'
 
                         if compact:
-                            with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-cyan-500 transition-colors p-0 overflow-hidden relative'):
+                            with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-cyan-500 transition-colors p-0 overflow-hidden relative'):
                                 with ui.row().classes('absolute top-1 left-1 bg-black/70 rounded px-0.5 z-10'):
                                     ui.checkbox().bind_value(state.sel_prompt, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'prompt'), ['shiftKey']).props('dense size=xs')
                                 if nsfw_tier:
@@ -5506,7 +5835,7 @@ def index_page():
                                 source_badges.append((f"Détaillé: {detailed_source}", 'text-cyan-300 bg-cyan-900/30 border-cyan-700'))
                             preview_short = preview[:240] + ('...' if len(preview) > 240 else '')
 
-                            with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-cyan-500 transition-colors p-0 overflow-hidden relative'):
+                            with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-cyan-500 transition-colors p-0 overflow-hidden relative'):
                                 with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                     ui.checkbox().bind_value(state.sel_prompt, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'prompt'), ['shiftKey'])
                                 if nsfw_tier:
@@ -7094,6 +7423,30 @@ def index_page():
                         prompt_text = str(prompt_item.get('text') or '').strip()
                         detailed_source = str(detailed_item.get('source') or '').strip().lower()
                         detailed_text = str(detailed_item.get('text') or '').strip()
+
+                        # Nettoyer les entrées polluées par des métadonnées XMP/XML Adobe
+                        _xmp_markers = ('<?xpacket', '<x:xmpmeta', '<?xml', '<rdf:', '<dc:')
+                        for _field, _src_attr in ((prompt_text, 'prompt_source'), (detailed_text, 'detailed_source')):
+                            _t = _field.lstrip()
+                            if _t.startswith(_xmp_markers) or (_t.startswith('<') and 'xmlns:' in _t[:500]):
+                                if _field is prompt_text:
+                                    search_engine.db_cache.save_prompt(path, '', source=prompt_source or 'image_metadata_positive_prompt')
+                                    prompt_text = ''
+                                    prompt_source = ''
+                                else:
+                                    search_engine.db_cache.save_detailed_prompt(path, '', source=detailed_source or 'heuristic')
+                                    detailed_text = ''
+                                    detailed_source = ''
+
+                        # Rejeter les faux positifs numériques du cache (ex : '68', '127', "['68', 0]")
+                        if prompt_text and not TagEngine._is_valid_prompt_text(prompt_text):
+                            search_engine.db_cache.save_prompt(path, '', source=prompt_source or '')
+                            prompt_text = ''
+                            prompt_source = ''
+                        if detailed_text and not TagEngine._is_valid_prompt_text(detailed_text):
+                            search_engine.db_cache.save_detailed_prompt(path, '', source=detailed_source or '')
+                            detailed_text = ''
+                            detailed_source = ''
 
                         # Load prompts from .txt sidecar files if present and not already cached
                         p = Path(path)

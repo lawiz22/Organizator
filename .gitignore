@@ -40,12 +40,20 @@ Thumbs.db
 *.sqlite3
 
 # Organizator generated artifacts
+organizator_rules.json
 rapport_organizator_*.json
 rapport_organizator_compact_*.json
 
 # Runtime cache / logs
 dir_cache.json
 crash_runtime.log
+ollama_runtime.log
+*.log
+
+# Thumbnail / image cache
+.thumbs/
+image_cache.db-shm
+image_cache.db-wal
 
 # Large model files (multi-GB, not tracked in git)
 models/
