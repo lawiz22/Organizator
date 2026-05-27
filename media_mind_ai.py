@@ -538,10 +538,19 @@ def _extract_first_json_object(text: str) -> dict:
     return {}
 
 
-def _ollama_generate(model: str, prompt: str, system: str = "") -> str:
+def _ollama_generate(model: str, prompt: str, system: str = "", image_path: str = "") -> str:
     req_id = f"g{time.time_ns() % 1000000000:09d}"
     started = time.monotonic()
     timeout_s = _ollama_timeout_seconds()
+    # Encode l'image en base64 si fournie (pour les modèles de vision)
+    images_b64 = []
+    if image_path and os.path.isfile(image_path):
+        try:
+            import base64
+            with open(image_path, 'rb') as _f:
+                images_b64.append(base64.b64encode(_f.read()).decode('ascii'))
+        except Exception as _e:
+            _ollama_trace('generate.image_encode_error', req_id=req_id, error=repr(_e))
     _ollama_trace(
         'generate.start',
         req_id=req_id,
@@ -550,6 +559,7 @@ def _ollama_generate(model: str, prompt: str, system: str = "") -> str:
         prompt_len=len(prompt or ''),
         system_len=len(system or ''),
         timeout_s=f"{timeout_s:.1f}",
+        has_image=bool(images_b64),
     )
     payload = {
         "model": model,
@@ -561,6 +571,8 @@ def _ollama_generate(model: str, prompt: str, system: str = "") -> str:
     }
     if system:
         payload["system"] = system
+    if images_b64:
+        payload["images"] = images_b64
     req = urllib_request.Request(
         f"{_ollama_base_url()}/api/generate",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -655,29 +667,34 @@ def _ollama_detailed_prompt(model: str, prompt_text: str, tags_dict: dict, ai_pa
     nsfw_label = str(((ai_payload.get("nsfw") or {}).get("top_label") or "")).strip()
     aes_score = (ai_payload.get("aesthetic") or {}).get("avg_score")
     faces_count = (ai_payload.get("faces") or {}).get("count")
+    has_image = bool(path and os.path.isfile(path))
     system = (
-        "You write a detailed, clean, reusable image prompt. "
+        "You write a detailed, clean, reusable image prompt by DESCRIBING THE ATTACHED IMAGE. "
+        "Your primary source of truth is the image itself; the text inputs are only secondary context. "
         "Return ONLY the final prompt in plain text, with no title and no explanation. "
         "Never repeat the base prompt or tags verbatim. "
         "Start directly with the generated prompt. "
         "Output MUST be in English. "
         "Use natural prose (2 to 4 sentences), never a tag list. "
         "Do not use prefixes like 'Tags:' or comma-only lists. "
-        "Do not invent subject, character, action, setting, camera move, or sexual content that is not supported by the provided signals. "
-        "If information is weak or ambiguous, stay conservative and reformulate without adding external elements."
+        "Describe ONLY what is actually visible in the image. Do not invent characters, actions, settings, or details not present. "
+        "If the image is unclear, stay conservative and describe only what you can clearly see."
     )
     user_prompt = (
-        f"Base prompt (context only, do not repeat): {prompt_text or 'none'}\n"
-        f"Tags: {top_tags or 'none'}\n"
+        ("Look at the attached image and describe it as a detailed reusable prompt.\n\n" if has_image
+         else "No image available — use only the textual context below.\n\n")
+        + f"Base prompt (context only, do not repeat): {prompt_text or 'none'}\n"
+        f"Tags (hints only, may be wrong): {top_tags or 'none'}\n"
         f"NSFW: {nsfw_label or 'unknown'}\n"
         f"Aesthetic score: {aes_score if aes_score is not None else 'unknown'}\n"
         f"Faces: {faces_count if faces_count is not None else 'unknown'}\n"
-        f"File: {os.path.basename(path) if path else 'unknown'}\n"
-        "Generate a coherent, visually rich detailed prompt as one compact output in English. "
-        "If there is no base prompt, rely only on provided tags/signals and do not invent external elements. "
-        "Do not start with the base prompt."
+        f"File: {os.path.basename(path) if path else 'unknown'}\n\n"
+        + ("Now generate a coherent, visually rich detailed prompt in English DESCRIBING WHAT YOU SEE IN THE IMAGE. "
+           if has_image else
+           "Generate a coherent, visually rich detailed prompt in English from the textual context only. ")
+        + "Do not start with the base prompt. Do not invent elements not in the image."
     )
-    out = _ollama_generate(model, user_prompt, system=system).strip()
+    out = _ollama_generate(model, user_prompt, system=system, image_path=path).strip()
     # Strip echoed input prefix if the model repeated it despite instructions
     if prompt_text:
         stripped = prompt_text.strip()
@@ -690,26 +707,32 @@ def _ollama_detailed_prompt(model: str, prompt_text: str, tags_dict: dict, ai_pa
     return out
 
 
-def _ollama_raw_prompt(model: str, prompt_text: str, tags_dict: dict) -> str:
+def _ollama_raw_prompt(model: str, prompt_text: str, tags_dict: dict, image_path: str = "") -> str:
     req_id = f"r{time.time_ns() % 1000000000:09d}"
     started = time.monotonic()
     _ollama_trace('raw_prompt.start', req_id=req_id, model=model, prompt_len=len(prompt_text or ''), tags_count=len(tags_dict or {}))
     top_tags = ", ".join(tag for tag, _score in sorted((tags_dict or {}).items(), key=lambda x: -float(x[1]))[:20])
+    has_image = bool(image_path and os.path.isfile(image_path))
     system = (
-        "You produce a raw image prompt that is directly usable. "
+        "You produce a raw image prompt that is directly usable, by DESCRIBING THE ATTACHED IMAGE. "
+        "Your primary source of truth is the image itself; the text inputs are only secondary context. "
         "Return ONLY one single-line prompt, with no title and no explanation. "
         "Never repeat the input prompt verbatim. "
         "Start directly with the new prompt content. "
         "Output MUST be in English. "
-        "Do not invent subject, character, action, setting, camera move, or sexual content not supported by provided information. "
-        "If information is insufficient, do a minimal reformulation from the input prompt or tags without creative additions."
+        "Describe ONLY what is actually visible in the image. Do not invent characters, actions, settings, or details not present."
     )
     user_prompt = (
-        f"Input prompt (context only, do not repeat): {prompt_text or 'none'}\n"
-        f"Useful tags: {top_tags or 'none'}\n"
-        "Generate a compact and readable raw prompt in English. Do not start with the input prompt."
+        ("Look at the attached image and describe it as a compact single-line prompt.\n\n" if has_image
+         else "No image available — use only the textual context below.\n\n")
+        + f"Input prompt (context only, do not repeat): {prompt_text or 'none'}\n"
+        f"Useful tags (hints only, may be wrong): {top_tags or 'none'}\n\n"
+        + ("Now generate a compact and readable raw prompt in English DESCRIBING WHAT YOU SEE IN THE IMAGE. "
+           if has_image else
+           "Generate a compact and readable raw prompt in English from the textual context only. ")
+        + "Do not start with the input prompt."
     )
-    out = _ollama_generate(model, user_prompt, system=system).strip()
+    out = _ollama_generate(model, user_prompt, system=system, image_path=image_path).strip()
     # Strip echoed input prefix if the model repeated it despite instructions
     if prompt_text:
         stripped = prompt_text.strip()
@@ -717,6 +740,143 @@ def _ollama_raw_prompt(model: str, prompt_text: str, tags_dict: dict) -> str:
             out = out[len(stripped):].lstrip(' .,;\n').strip()
     _ollama_trace('raw_prompt.done', req_id=req_id, elapsed_s=f"{(time.monotonic() - started):.2f}", out_len=len(out or ''))
     return out
+
+
+def _ollama_detect_ai(model: str, image_path: str) -> dict:
+    """Demande à un modèle de vision Ollama de décider si l'image est IA-générée.
+
+    Retourne dict {is_ai: bool, confidence: float (0..1), reason: str, raw: str}.
+    En cas d'erreur ou de parsing impossible, is_ai=None.
+    """
+    req_id = f"ai{time.time_ns() % 1000000000:09d}"
+    started = time.monotonic()
+    _ollama_trace('detect_ai.start', req_id=req_id, model=model, path=image_path)
+    system = (
+        "You are a forensic image analyst. Look carefully at the attached image and decide whether "
+        "it was generated by an AI image generator (Stable Diffusion, Midjourney, DALL-E, ComfyUI, "
+        "NovelAI, Flux, etc.) or whether it is a real photograph (or a hand-made drawing/painting). "
+        "Consider: anatomical errors (extra fingers, melted hands, wrong eye gaze), texture artifacts, "
+        "background nonsense, plastic/airbrushed skin, hair physics, text rendering, perfect symmetry, "
+        "lighting consistency. "
+        "Respond with ONLY a single line of valid JSON, no markdown, no prose, in this exact shape: "
+        '{\"is_ai\": true|false, \"confidence\": 0.0-1.0, \"reason\": \"short explanation\"}'
+    )
+    user_prompt = "Analyze the attached image and return the JSON verdict."
+    raw = ""
+    try:
+        raw = _ollama_generate(model, user_prompt, system=system, image_path=image_path).strip()
+    except Exception as e:
+        _ollama_trace('detect_ai.error', req_id=req_id, error=repr(e))
+        return {'is_ai': None, 'confidence': 0.0, 'reason': f'ollama_error: {e}', 'raw': ''}
+    # Tentative parsing JSON; on tolère du texte autour
+    parsed = None
+    s = raw.strip()
+    # Si du texte avant/après, isoler le premier objet {...}
+    if s and s[:1] != '{':
+        start = s.find('{')
+        end = s.rfind('}')
+        if start >= 0 and end > start:
+            s = s[start:end + 1]
+    try:
+        parsed = json.loads(s)
+    except Exception:
+        parsed = None
+    if not isinstance(parsed, dict):
+        _ollama_trace('detect_ai.parse_failed', req_id=req_id, raw_snippet=raw[:200])
+        # Heuristique de secours: chercher "ai" / "real" dans le texte brut
+        low = raw.lower()
+        if 'is_ai' in low and ('true' in low or 'yes' in low):
+            return {'is_ai': True, 'confidence': 0.5, 'reason': 'parsed_from_text', 'raw': raw}
+        if 'is_ai' in low and ('false' in low or 'no' in low):
+            return {'is_ai': False, 'confidence': 0.5, 'reason': 'parsed_from_text', 'raw': raw}
+        return {'is_ai': None, 'confidence': 0.0, 'reason': 'unparsable_response', 'raw': raw}
+    is_ai_raw = parsed.get('is_ai')
+    if isinstance(is_ai_raw, str):
+        is_ai = is_ai_raw.strip().lower() in ('true', 'yes', '1', 'ai')
+    else:
+        is_ai = bool(is_ai_raw)
+    try:
+        conf = float(parsed.get('confidence', 0.0))
+    except Exception:
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+    reason = str(parsed.get('reason', '') or '')[:500]
+    _ollama_trace('detect_ai.done', req_id=req_id, elapsed_s=f"{(time.monotonic() - started):.2f}", is_ai=is_ai, confidence=conf)
+    return {'is_ai': is_ai, 'confidence': conf, 'reason': reason, 'raw': raw}
+
+
+def run_ai_detection(path: str, ollama_model: str = "", use_ollama_fallback: bool = True) -> dict:
+    """Pipeline 3-passes pour décider si une image est IA-générée.
+
+    Passe 1 : signature de générateur dans les métadonnées image → IA confirmé.
+    Passe 2 : EXIF appareil photo cohérent (Make/Model/Lens/Exposure) → photo réelle.
+    Passe 3 : fallback vision Ollama (si modèle fourni et `use_ollama_fallback`).
+
+    Retourne un dict prêt à sérialiser en sidecar `.ia` :
+    {is_ai, confidence, method, detected_at, ai_metadata, exif, ollama_reasoning}
+    """
+    detected_at = time.strftime('%Y-%m-%dT%H:%M:%S')
+    result = {
+        'is_ai': None,
+        'confidence': 0.0,
+        'method': 'unknown',
+        'detected_at': detected_at,
+        'ai_metadata': {},
+        'exif': {},
+        'ollama_reasoning': '',
+    }
+    if not path or not os.path.isfile(path):
+        result['method'] = 'file_missing'
+        return result
+
+    # Passe 1 : metadata
+    meta = TagEngine._detect_ai_from_metadata(path)
+    if meta.get('is_ai') is True:
+        result.update({
+            'is_ai': True,
+            'confidence': float(meta.get('confidence', 0.9)),
+            'method': f"metadata:{meta.get('source', '')}",
+            'ai_metadata': meta.get('evidence', {}),
+        })
+        # On capture quand même l'EXIF pour info
+        result['exif'] = TagEngine._extract_exif_camera_info(path)
+        return result
+
+    # Passe 2 : EXIF appareil photo
+    exif_info = TagEngine._extract_exif_camera_info(path)
+    result['exif'] = exif_info
+    photo_check = TagEngine._detect_real_photo_from_exif(exif_info)
+    if photo_check.get('is_photo'):
+        result.update({
+            'is_ai': False,
+            'confidence': float(photo_check.get('confidence', 0.7)),
+            'method': f"exif_camera:{','.join(photo_check.get('signals', []))}",
+        })
+        return result
+
+    # Passe 3 : fallback vision Ollama
+    if use_ollama_fallback and ollama_model:
+        try:
+            ai_resp = _ollama_detect_ai(ollama_model, path)
+        except Exception as e:
+            result['method'] = f'ollama_error:{e}'
+            return result
+        is_ai_v = ai_resp.get('is_ai')
+        if is_ai_v is None:
+            result['method'] = 'ollama_inconclusive'
+            result['ollama_reasoning'] = ai_resp.get('reason', '') or ai_resp.get('raw', '')[:300]
+            return result
+        result.update({
+            'is_ai': bool(is_ai_v),
+            'confidence': float(ai_resp.get('confidence', 0.5)),
+            'method': f'ollama:{ollama_model}',
+            'ollama_reasoning': ai_resp.get('reason', '')[:500],
+        })
+        return result
+
+    # Rien de concluant
+    result['method'] = 'inconclusive_no_ollama'
+    return result
 
 
 @app.get('/api/llm/ollama_models')
@@ -985,6 +1145,8 @@ class DatabaseCache:
         c.execute('''CREATE TABLE IF NOT EXISTS tags_cache (model TEXT, path TEXT, tags TEXT, PRIMARY KEY (model, path))''')
         c.execute('''CREATE TABLE IF NOT EXISTS prompt_cache (path TEXT PRIMARY KEY, source TEXT, prompt TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS detailed_prompt_cache (path TEXT PRIMARY KEY, source TEXT, prompt TEXT)''')
+        # Cache détection IA: un seul état par path (verdict + métadonnées JSON)
+        c.execute('''CREATE TABLE IF NOT EXISTS ai_detection_cache (path TEXT PRIMARY KEY, is_ai INTEGER, confidence REAL, method TEXT, detection TEXT, updated_at REAL)''')
         
         c.execute('CREATE INDEX IF NOT EXISTS idx_nsfw_path ON nsfw_cache(path)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_emb_path ON emb_cache(path)')
@@ -992,6 +1154,7 @@ class DatabaseCache:
         c.execute('CREATE INDEX IF NOT EXISTS idx_tags_path ON tags_cache(path)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_prompt_path ON prompt_cache(path)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_detailed_prompt_path ON detailed_prompt_cache(path)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_ai_detection_path ON ai_detection_cache(path)')
         self.conn.commit()
 
     # --- Danbooru Tags ---
@@ -1080,6 +1243,42 @@ class DatabaseCache:
             "INSERT OR REPLACE INTO detailed_prompt_cache (path, source, prompt) VALUES (?, ?, ?)",
             (path, source, prompt_text),
         )
+        self.conn.commit()
+
+    # --- Détection IA ---
+    def get_ai_detection(self, path):
+        c = self.conn.cursor()
+        c.execute("SELECT is_ai, confidence, method, detection, updated_at FROM ai_detection_cache WHERE path=?", (path,))
+        row = c.fetchone()
+        if not row:
+            return None
+        try:
+            det = json.loads(row[3]) if row[3] else {}
+        except Exception:
+            det = {}
+        return {
+            "is_ai": bool(row[0]) if row[0] is not None else None,
+            "confidence": float(row[1] or 0.0),
+            "method": str(row[2] or ''),
+            "detection": det if isinstance(det, dict) else {},
+            "updated_at": float(row[4] or 0.0),
+        }
+
+    def save_ai_detection(self, path, is_ai, confidence, method, detection):
+        c = self.conn.cursor()
+        try:
+            det_json = json.dumps(detection or {}, ensure_ascii=False, default=str)
+        except Exception:
+            det_json = '{}'
+        c.execute(
+            "INSERT OR REPLACE INTO ai_detection_cache (path, is_ai, confidence, method, detection, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (path, 1 if is_ai else 0, float(confidence or 0.0), str(method or ''), det_json, float(time.time())),
+        )
+        self.conn.commit()
+
+    def delete_ai_detection(self, path):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM ai_detection_cache WHERE path=?", (path,))
         self.conn.commit()
 
     # --- Face ---
@@ -1249,7 +1448,7 @@ class DatabaseCache:
     def remove_paths(self, paths_to_remove):
         if not paths_to_remove: return
         c = self.conn.cursor()
-        tables = ['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache', 'tags_cache', 'prompt_cache', 'detailed_prompt_cache']
+        tables = ['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache', 'tags_cache', 'prompt_cache', 'detailed_prompt_cache', 'ai_detection_cache']
         chunk_size = 900
         for i in range(0, len(paths_to_remove), chunk_size):
             chunk = paths_to_remove[i:i+chunk_size]
@@ -1275,8 +1474,10 @@ class FilesCache:
         except json.JSONDecodeError: return {}
 
     def save_cache(self):
+        # Écriture compacte : pour de gros dossiers (75k+ fichiers) un indent=4
+        # peut faire un fichier de plusieurs Mo et bloquer 1-2s à chaque save.
         with open(self.FILE_NAME, 'w', encoding='utf-8') as f:
-            json.dump(self._data, f, indent=4)
+            json.dump(self._data, f, separators=(',', ':'))
 
     def list_files(self, directory):
         return self._data.get(directory, None)
@@ -1458,11 +1659,12 @@ class SearchEngine:
             self.current_emb_model_state = current_state
         return self.embedding_model
 
-    def _gather_files(self, dir_path, allowed_exts):
-        files_list = self.files_cache.list_files(dir_path)
-        if files_list is None:
-            self.log(f"Indexation du système de fichiers : {dir_path}...")
-            all_supported = SUPPORTED_IMAGES + SUPPORTED_VIDEOS + SUPPORTED_TEXTS
+    def _gather_files(self, dir_path, allowed_exts, force_rescan: bool = False):
+        cached_list = None if force_rescan else self.files_cache.list_files(dir_path)
+        all_supported = SUPPORTED_IMAGES + SUPPORTED_VIDEOS + SUPPORTED_TEXTS
+
+        if cached_list is None:
+            self.log(f"Indexation du système de fichiers : {dir_path}{' (rescan forcé)' if force_rescan else ''}...")
             files_list = []
             for root, dirs, files in os.walk(dir_path):
                 if self.cancel_flag: break
@@ -1474,14 +1676,34 @@ class SearchEngine:
                 self.files_cache.save_cache()
                 self.log(f"Fichiers supportés trouvés : {len(files_list)}")
         else:
-            # Auto-guérison : retirer du cache les fichiers supprimés ou déplacés
-            existing = [f for f in files_list if os.path.isfile(f)]
-            if len(existing) < len(files_list):
-                removed = len(files_list) - len(existing)
-                self.log(f"[dir_cache] {removed} fichier(s) introuvable(s) retiré(s) du cache ({dir_path})")
-                self.files_cache._data[dir_path] = existing
-                self.files_cache.save_cache()
-                files_list = existing
+            # Walk disque (1 passe) pour détecter à la fois les disparus ET les nouveaux arrivants
+            disk_set = set()
+            walk_cancelled = False
+            for root, dirs, files in os.walk(dir_path):
+                if self.cancel_flag:
+                    walk_cancelled = True
+                    break
+                for file in files:
+                    if file.lower().endswith(all_supported):
+                        disk_set.add(os.path.join(root, file))
+            if walk_cancelled:
+                # Annulation : on ne touche pas au cache, on rend la liste cache telle quelle
+                files_list = cached_list
+            else:
+                cached_set = set(cached_list)
+                removed = cached_set - disk_set
+                added = disk_set - cached_set
+                if removed or added:
+                    # Préserve l'ordre des entrées existantes, ajoute les nouveautés à la fin
+                    files_list = [f for f in cached_list if f in disk_set] + sorted(added)
+                    if removed:
+                        self.log(f"[dir_cache] {len(removed)} fichier(s) disparu(s) retiré(s) ({dir_path})")
+                    if added:
+                        self.log(f"[dir_cache] {len(added)} nouveau(x) fichier(s) détecté(s) ({dir_path})")
+                    self.files_cache._data[dir_path] = files_list
+                    self.files_cache.save_cache()
+                else:
+                    files_list = cached_list
         return [f for f in files_list if f.lower().endswith(allowed_exts)]
 
     def _load_and_prep_file(self, file_path, phase='embedding'):
@@ -3143,6 +3365,243 @@ class TagEngine:
         return ". ".join(part.strip().rstrip('.') for part in parts if part).strip() + "."
 
     @staticmethod
+    def _read_sidecar_prompt_txt(path: str) -> str:
+        """Lit un .txt sidecar à côté du média si présent.
+
+        Conventions reconnues (dans l'ordre): `{stem}_prompt.txt` puis `{stem}.txt`
+        (convention SD WebUI / kohya). Retourne le texte nettoyé, ou '' si rien
+        de valide.
+        """
+        try:
+            p = Path(path)
+            for candidate in (p.with_name(f"{p.stem}_prompt.txt"), p.with_suffix('.txt')):
+                if candidate.exists() and candidate.is_file():
+                    try:
+                        txt = candidate.read_text(encoding='utf-8', errors='ignore').strip()
+                    except Exception:
+                        continue
+                    if txt and TagEngine._is_valid_prompt_text(txt):
+                        return txt
+        except Exception:
+            pass
+        return ""
+
+    # ------------------------------------------------------------------
+    # Détection IA (sidecar .ia + extraction signatures + EXIF caméra)
+    # ------------------------------------------------------------------
+    # Clés metadata typiques des générateurs IA connus
+    _AI_METADATA_SIGNATURES = (
+        # PNG tEXt chunks
+        ("info", "parameters"),               # Automatic1111 / Forge / SD WebUI
+        ("info", "prompt"),                   # ComfyUI
+        ("info", "workflow"),                 # ComfyUI
+        ("info", "sd-metadata"),              # InvokeAI legacy
+        ("info", "invokeai_metadata"),        # InvokeAI v3+
+        ("info", "invokeai"),                 # InvokeAI
+        ("info", "software"),                 # NovelAI, Fooocus parfois
+        ("info", "comment"),                  # NovelAI
+        ("info", "title"),                    # NovelAI parfois
+        ("info", "description"),              # divers
+        ("info", "dream"),                    # vieux Stable Diffusion
+        ("info", "novelai"),                  # NovelAI
+        ("info", "extras"),                   # divers
+    )
+
+    # Mots-clés textuels (case-insensitive) qui prouvent une origine IA
+    _AI_TEXT_MARKERS = (
+        "stable diffusion", "stablediffusion", "automatic1111", "a1111",
+        "comfyui", "comfy ui", "invokeai", "invoke ai", "novelai", "novel ai",
+        "fooocus", "easydiffusion", "stable-diffusion-webui", "sdxl",
+        "diffusers", "midjourney", "dall-e", "dall·e", "dalle", "leonardo.ai",
+        "stability ai", "stability.ai", "kohya", "lora:", "<lora:",
+        "negative prompt:", "sampler:", "cfg scale:", "steps:", "denoising strength",
+        "model hash:", "vae hash:", "schedule type:", "scheduler:",
+    )
+
+    # Marqueurs EXIF d'appareil photo réel
+    _CAMERA_EXIF_KEYS = (
+        "make", "model", "lensmake", "lensmodel", "focallength", "fnumber",
+        "exposuretime", "isospeedratings", "photographicsensitivity",
+        "datetimeoriginal", "gpsinfo",
+    )
+
+    @staticmethod
+    def _read_sidecar_ia(path: str) -> dict:
+        """Lit un .ia JSON sidecar (`{stem}.ia`) si présent. Retourne dict ou {}."""
+        try:
+            p = Path(path)
+            candidate = p.with_suffix('.ia')
+            if candidate.exists() and candidate.is_file():
+                try:
+                    data = json.loads(candidate.read_text(encoding='utf-8', errors='ignore'))
+                    if isinstance(data, dict):
+                        return data
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return {}
+
+    @staticmethod
+    def _write_sidecar_ia(path: str, detection: dict) -> bool:
+        """Écrit le sidecar `{stem}.ia` (JSON UTF-8). True si OK."""
+        try:
+            p = Path(path)
+            candidate = p.with_suffix('.ia')
+            payload = json.dumps(detection or {}, ensure_ascii=False, indent=2, default=str)
+            candidate.write_text(payload, encoding='utf-8')
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _extract_exif_camera_info(path: str) -> dict:
+        """Extrait les champs EXIF typiques d'un APN. Retourne un dict (vide si rien)."""
+        out = {}
+        try:
+            with Image.open(path) as img:
+                exif = img.getexif() or {}
+                for key, value in exif.items():
+                    name = str(ExifTags.TAGS.get(key, key)).strip()
+                    name_l = name.lower()
+                    if name_l in TagEngine._CAMERA_EXIF_KEYS:
+                        try:
+                            if isinstance(value, bytes):
+                                try:
+                                    value = value.decode('utf-8', errors='ignore').strip('\x00').strip()
+                                except Exception:
+                                    value = str(value)
+                            out[name] = value if isinstance(value, (str, int, float)) else str(value)
+                        except Exception:
+                            continue
+                # Software field aussi
+                soft = exif.get(305)  # Software
+                if soft and 'Software' not in out:
+                    out['Software'] = soft if isinstance(soft, str) else str(soft)
+        except Exception:
+            pass
+        # Nettoyer chaînes vides
+        return {k: v for k, v in out.items() if v not in (None, '', b'')}
+
+    @staticmethod
+    def _detect_ai_from_metadata(path: str) -> dict:
+        """Inspecte le PNG info + EXIF pour détecter une signature de générateur IA.
+
+        Retourne dict: {is_ai: bool|None, confidence: float, source: str, evidence: dict}
+        - is_ai=True si signature trouvée
+        - is_ai=None si aucune métadonnée concluante (à fallback Ollama)
+        """
+        evidence = {}
+        try:
+            with Image.open(path) as img:
+                info = getattr(img, 'info', {}) or {}
+                # Chercher clés signatures
+                for _, key_name in TagEngine._AI_METADATA_SIGNATURES:
+                    if key_name in info:
+                        val = info[key_name]
+                        if val is None:
+                            continue
+                        sval = val if isinstance(val, str) else str(val)
+                        sval_l = sval.lower()
+                        # Si le contenu mentionne explicitement un outil IA → confiance max
+                        for marker in TagEngine._AI_TEXT_MARKERS:
+                            if marker in sval_l:
+                                return {
+                                    'is_ai': True,
+                                    'confidence': 0.99,
+                                    'source': f'png_info:{key_name}',
+                                    'evidence': {key_name: sval[:1000]},
+                                }
+                        # Clé typiquement IA (parameters, prompt ComfyUI, sd-metadata) → forte présomption
+                        if key_name in {'parameters', 'sd-metadata', 'invokeai_metadata', 'invokeai', 'novelai', 'dream'}:
+                            return {
+                                'is_ai': True,
+                                'confidence': 0.95,
+                                'source': f'png_info:{key_name}',
+                                'evidence': {key_name: sval[:1000]},
+                            }
+                        # Workflow/prompt ComfyUI : valider que c'est bien du JSON ComfyUI
+                        if key_name in {'workflow', 'prompt'} and sval.strip()[:1] in '{[':
+                            try:
+                                parsed = json.loads(sval)
+                                if isinstance(parsed, dict) and parsed:
+                                    return {
+                                        'is_ai': True,
+                                        'confidence': 0.95,
+                                        'source': f'png_info:{key_name}',
+                                        'evidence': {key_name: 'ComfyUI workflow JSON détecté'},
+                                    }
+                            except Exception:
+                                pass
+                        evidence[key_name] = sval[:500]
+
+                # Chercher dans EXIF (UserComment etc.) des marqueurs textuels IA
+                try:
+                    exif = img.getexif() or {}
+                    blob_parts = []
+                    for key, value in exif.items():
+                        name = str(ExifTags.TAGS.get(key, key)).strip().lower()
+                        if name in {'usercomment', 'imagedescription', 'xpkeywords', 'xpcomment', 'software'}:
+                            if isinstance(value, bytes):
+                                for enc in ('utf-8', 'utf-16', 'utf-16-le', 'latin-1'):
+                                    try:
+                                        value = value.decode(enc, errors='ignore')
+                                        break
+                                    except Exception:
+                                        continue
+                            if value:
+                                blob_parts.append(str(value))
+                    blob = ' \n '.join(blob_parts).lower()
+                    for marker in TagEngine._AI_TEXT_MARKERS:
+                        if marker in blob:
+                            return {
+                                'is_ai': True,
+                                'confidence': 0.9,
+                                'source': 'exif_text',
+                                'evidence': {'exif_snippet': blob[:500]},
+                            }
+                except Exception:
+                    pass
+        except Exception as e:
+            return {'is_ai': None, 'confidence': 0.0, 'source': 'error', 'evidence': {'error': str(e)}}
+
+        return {'is_ai': None, 'confidence': 0.0, 'source': 'metadata_inconclusive', 'evidence': evidence}
+
+    @staticmethod
+    def _detect_real_photo_from_exif(exif_info: dict) -> dict:
+        """Évalue la probabilité que ce soit une photo réelle d'après l'EXIF caméra.
+
+        Retourne {is_photo: bool, confidence: float, signals: list[str]}.
+        """
+        if not exif_info:
+            return {'is_photo': False, 'confidence': 0.0, 'signals': []}
+        signals = []
+        has_make = any(k.lower() == 'make' for k in exif_info)
+        has_model = any(k.lower() == 'model' for k in exif_info)
+        has_lens = any(k.lower() in ('lensmake', 'lensmodel') for k in exif_info)
+        has_exposure = any(k.lower() in ('exposuretime', 'fnumber', 'focallength') for k in exif_info)
+        has_gps = any(k.lower() == 'gpsinfo' for k in exif_info)
+        has_dt = any(k.lower() == 'datetimeoriginal' for k in exif_info)
+        if has_make: signals.append('Make')
+        if has_model: signals.append('Model')
+        if has_lens: signals.append('Lens')
+        if has_exposure: signals.append('ExposureSettings')
+        if has_gps: signals.append('GPS')
+        if has_dt: signals.append('DateTimeOriginal')
+        score = 0.0
+        if has_make and has_model: score += 0.5
+        if has_lens: score += 0.15
+        if has_exposure: score += 0.2
+        if has_gps: score += 0.1
+        if has_dt: score += 0.05
+        # Logiciel d'édition typique → ne casse pas le verdict mais on note
+        soft = str(exif_info.get('Software', '')).lower()
+        if any(s in soft for s in ('stable diffusion', 'comfy', 'invoke', 'novelai', 'midjourney', 'dall')):
+            return {'is_photo': False, 'confidence': 0.9, 'signals': signals + [f'Software:{soft}']}
+        is_photo = score >= 0.5
+        return {'is_photo': is_photo, 'confidence': min(score, 0.95), 'signals': signals}
+
+    @staticmethod
     def _extract_prompt_from_image_metadata(path: str) -> str:
         try:
             candidates = []
@@ -3458,10 +3917,33 @@ class TagEngine:
             cached_tags = self.db_cache.get_tags(cache_key, p)
             # Skip only if tags already exist in cache. Having a cached prompt is NOT a reason to skip tag generation.
             if cached_tags is None or len(cached_tags) == 0:
+                # 1) Prompt embarqué dans les métadonnées de l'image (ComfyUI/A1111)
                 embedded_prompt = self._extract_prompt_from_image_metadata(p)
                 if embedded_prompt:
                     self.db_cache.save_prompt(p, embedded_prompt, source="image_metadata_positive_prompt")
                     metadata_prompted += 1
+                else:
+                    # 2) Fallback: sidecar .txt à côté du fichier (SD WebUI / kohya / _prompt.txt)
+                    existing = self.db_cache.get_prompt(p) or {}
+                    if not str(existing.get('text') or '').strip():
+                        txt_prompt = self._read_sidecar_prompt_txt(p)
+                        if txt_prompt:
+                            self.db_cache.save_prompt(p, txt_prompt, source="file_sidecar")
+                            metadata_prompted += 1
+                # 3) Sidecar .ia : pré-population du cache détection IA (sans Ollama)
+                try:
+                    if self.db_cache.get_ai_detection(p) is None:
+                        ia_side = self._read_sidecar_ia(p)
+                        if ia_side and ia_side.get('is_ai') is not None:
+                            self.db_cache.save_ai_detection(
+                                p,
+                                bool(ia_side.get('is_ai')),
+                                float(ia_side.get('confidence', 0.0) or 0.0),
+                                str(ia_side.get('method', 'sidecar')),
+                                ia_side,
+                            )
+                except Exception:
+                    pass
                 images_to_process.append(p)
         for p in video_paths:
             cached_tags = self.db_cache.get_tags(cache_key, p)
@@ -3646,6 +4128,11 @@ class AppState:
         self.sel_face = {}
         self.sel_tags = {}
         self.sel_prompt = {}
+
+        # Wizard de génération multi-photos (mode séquentiel: 1 photo à la fois)
+        self.prompt_wizard_queue = []   # liste des chemins restant à traiter (incluant le courant)
+        self.prompt_wizard_total = 0    # nombre total initial
+        self.prompt_wizard_done = 0     # nombre déjà sauvegardés
         
         self.search_page = 1
         self.aes_page = 1
@@ -3690,6 +4177,18 @@ class AppState:
         self.nsfw_compact = False
         self.aes_search = ''
         self.nsfw_search = ''
+
+        # --- Détecteur IA ---
+        self.sel_ia = {}
+        self.ia_results = []          # (score, path, is_ai, confidence, method, detection)
+        self.ia_page = 1
+        self.ia_base_dir = ""
+        self.ia_res_filter = 'Tout'
+        self.ia_status_filter = 'Tout'  # Tout | IA | Photo | Inconnu
+        self.ia_search = ''
+        self.ia_sort = 'score'
+        self.ia_per_page = 40
+        self.ia_compact = False
         self.aes_nsfw_filter_res = 'Tout'
         
         self.viewer_open = False
@@ -3945,6 +4444,7 @@ def index_page():
             tab_face = ui.tab('Face', label='Recherche Visage', icon='face')
             tab_tags = ui.tab('Tags', label='Tags Danbooru', icon='label')
             tab_prompt = ui.tab('Prompt', label='Prompts', icon='article')
+            tab_ia = ui.tab('IA', label='Détecteur IA', icon='auto_awesome')
             tab_cache = ui.tab('Cache', label='Indexeur', icon='storage')
             
         ui.button(icon='settings', on_click=lambda: global_settings_dialog.open()).props('flat round dense text-color=white').classes('shrink-0').tooltip('Paramètres généraux')
@@ -4559,6 +5059,9 @@ def index_page():
         if tab == 'prompt':
             prompt_gallery_ui.refresh()
             return
+        if tab == 'ia':
+            ia_gallery_ui.refresh()
+            return
         gallery = globals().get(f"{tab}_gallery_ui")
         if gallery:
             gallery.refresh()
@@ -4608,10 +5111,10 @@ def index_page():
                     shutil.move(path, dest)
                     moved_paths.add(path)
 
-                # Déplacer/copier les fichiers compagnons (_validation.json, .txt tags)
+                # Déplacer/copier les fichiers compagnons (_validation.json, _aesthetic.json, .txt tags, .json méta, .ia détection IA)
                 src_stem = os.path.splitext(path)[0]
                 dest_stem = os.path.splitext(dest)[0]
-                for companion_suffix in ('_validation.json', '_aesthetic.json', '.txt'):
+                for companion_suffix in ('_validation.json', '_aesthetic.json', '.txt', '.json', '.ia'):
                     companion_src = src_stem + companion_suffix
                     if os.path.isfile(companion_src):
                         companion_dst = dest_stem + companion_suffix
@@ -4664,9 +5167,9 @@ def index_page():
                         os.remove(path)
                         deleted += 1
                         deleted_set.add(path)
-                        # Supprimer les fichiers compagnons
+                        # Supprimer les fichiers compagnons (.txt tags, .json méta, _validation.json NSFW, _aesthetic.json esthétique, .ia détection IA)
                         stem = os.path.splitext(path)[0]
-                        for companion_suffix in ('_validation.json', '_aesthetic.json', '.txt', '.json'):
+                        for companion_suffix in ('_validation.json', '_aesthetic.json', '.txt', '.json', '.ia'):
                             companion = stem + companion_suffix
                             if os.path.isfile(companion):
                                 try:
@@ -4714,7 +5217,7 @@ def index_page():
         count = len(selected_paths)
         with ui.dialog() as confirm_dlg, ui.card().classes('bg-gray-900 text-white'):
             ui.label(f'⚠️ Supprimer {count} fichier(s) ?').classes('text-lg font-bold mb-1')
-            ui.label('Les fichiers compagnons (.txt, .json, _validation.json, _aesthetic.json) seront aussi supprimés.').classes('text-sm text-gray-400 mb-3')
+            ui.label('Les fichiers compagnons (.txt, .json, _validation.json, _aesthetic.json, .ia) seront aussi supprimés.').classes('text-sm text-gray-400 mb-3')
             with ui.row().classes('gap-2 mt-1'):
                 ui.button('Supprimer', icon='delete', on_click=lambda: (confirm_dlg.close(), _do_delete())).props('color=red')
                 ui.button('Annuler', on_click=confirm_dlg.close).props('outline color=white')
@@ -4963,7 +5466,8 @@ def index_page():
                         with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-blue-500 transition-colors p-0 overflow-hidden relative'):
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                 ui.checkbox().bind_value(state.sel_search, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'search'), ['shiftKey'])
-                            
+                            _emit_ia_badge_overlay(path, position_classes='top-2 right-2')
+
                             with ui.context_menu():
                                 ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -5105,6 +5609,7 @@ def index_page():
                                 if nsfw_tier:
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-1 right-1 text-[8px] font-bold px-1 rounded border {cls} z-10')
+                                _emit_ia_badge_overlay(path, position_classes='top-6 right-1', size_classes='text-[8px] px-1')
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -5121,6 +5626,7 @@ def index_page():
                                 if nsfw_tier:
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded border {cls} z-10')
+                                _emit_ia_badge_overlay(path, position_classes='top-8 right-2')
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -5360,6 +5866,7 @@ def index_page():
                             with ui.card().classes(f'bg-gray-800 border-2 {card_border} transition-colors p-0 overflow-hidden relative'):
                                 with ui.row().classes('absolute top-1 left-1 bg-black/70 rounded px-0.5 z-10'):
                                     ui.checkbox().bind_value(state.sel_nsfw, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'nsfw'), ['shiftKey']).props('dense size=xs')
+                                _emit_ia_badge_overlay(path, position_classes='top-1 right-1', size_classes='text-[8px] px-1')
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -5372,6 +5879,7 @@ def index_page():
                             with ui.card().classes(f'bg-gray-800 border-2 {card_border} transition-colors p-0 overflow-hidden relative'):
                                 with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                     ui.checkbox().bind_value(state.sel_nsfw, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'nsfw'), ['shiftKey'])
+                                _emit_ia_badge_overlay(path, position_classes='top-2 right-2')
 
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
@@ -5468,6 +5976,7 @@ def index_page():
                         with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-teal-500 transition-colors p-0 overflow-hidden relative'):
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                 ui.checkbox().bind_value(state.sel_face, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'face'), ['shiftKey'])
+                            _emit_ia_badge_overlay(path, position_classes='top-2 right-2')
 
                             with ui.context_menu():
                                 ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
@@ -5525,6 +6034,50 @@ def index_page():
     def _nsfw_badge_ui(tier: str):
         label, cls = _NSFW_BADGE.get(tier, _NSFW_BADGE[''])
         ui.label(label).classes(f'text-[9px] font-bold px-1 py-0.5 rounded border {cls}')
+
+    # --- HELPER : verdict IA (.ia sidecar + DB cache) ---
+    _ia_verdict_cache: dict = {}
+    _IA_OVERLAY_BADGES = {
+        True:  ('🤖 IA',     'bg-pink-900/60 text-pink-200 border-pink-700'),
+        False: ('📷 Photo',  'bg-emerald-900/60 text-emerald-200 border-emerald-700'),
+    }
+
+    def _read_ia_verdict(path: str):
+        """Retourne True (IA), False (Photo) ou None (inconnu).
+
+        Source de vérité : DB cache (rapide). Fallback : sidecar .ia.
+        """
+        if path in _ia_verdict_cache:
+            return _ia_verdict_cache[path]
+        verdict = None
+        try:
+            det = search_engine.db_cache.get_ai_detection(path)
+            if det and det.get('is_ai') is not None:
+                verdict = bool(det['is_ai'])
+        except Exception:
+            pass
+        if verdict is None:
+            stem = os.path.splitext(path)[0]
+            ia_path = stem + '.ia'
+            if os.path.isfile(ia_path):
+                try:
+                    import json as _j
+                    with open(ia_path, 'r', encoding='utf-8') as _f:
+                        data = _j.load(_f)
+                    if data.get('is_ai') is not None:
+                        verdict = bool(data['is_ai'])
+                except Exception:
+                    pass
+        _ia_verdict_cache[path] = verdict
+        return verdict
+
+    def _emit_ia_badge_overlay(path: str, position_classes: str = 'top-8 right-2', size_classes: str = 'text-[9px] px-1.5 py-0.5'):
+        """Emet un badge IA/Photo flottant si un verdict est disponible."""
+        v = _read_ia_verdict(path)
+        if v is None:
+            return
+        text, cls = _IA_OVERLAY_BADGES[v]
+        ui.label(text).classes(f'absolute {position_classes} {size_classes} font-bold rounded border {cls} z-10')
 
     # --- COMPOSANT GALERIE TAGS ---
     @ui.refreshable
@@ -5652,6 +6205,7 @@ def index_page():
                                 if nsfw_tier:
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-1 right-1 text-[8px] font-bold px-1 rounded border {cls} z-10')
+                                _emit_ia_badge_overlay(path, position_classes='top-6 right-1', size_classes='text-[8px] px-1')
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -5665,6 +6219,7 @@ def index_page():
                                 if nsfw_tier:
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded border {cls} z-10')
+                                _emit_ia_badge_overlay(path, position_classes='top-8 right-2')
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -5816,6 +6371,7 @@ def index_page():
                                 if nsfw_tier:
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-1 right-1 text-[8px] font-bold px-1 rounded border {cls} z-10')
+                                _emit_ia_badge_overlay(path, position_classes='top-6 right-1', size_classes='text-[8px] px-1')
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -5841,6 +6397,7 @@ def index_page():
                                 if nsfw_tier:
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded border {cls} z-10')
+                                _emit_ia_badge_overlay(path, position_classes='top-8 right-2')
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -5859,7 +6416,144 @@ def index_page():
 
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=cyan').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Haut de page')
 
-    # --- ZONE DE TRAVAIL PRINCIPALE ---
+    # ------------------------------------------------------------------
+    # Galerie Détecteur IA — clone allégé de prompt_gallery_ui()
+    # ------------------------------------------------------------------
+    _IA_BADGES = {
+        True:  ('🤖 IA',     'bg-pink-900/40 text-pink-200 border-pink-700'),
+        False: ('📷 Photo',  'bg-emerald-900/40 text-emerald-200 border-emerald-700'),
+        None:  ('❓ Inconnu', 'bg-gray-800 text-gray-300 border-gray-600'),
+    }
+
+    @ui.refreshable
+    def ia_gallery_ui():
+        if not state.ia_results:
+            return ui.label("Lance une analyse pour peupler la galerie de détection IA…").classes("text-gray-400 m-4")
+
+        search_q = str(state.ia_search or '').strip().lower()
+        status_filter = str(getattr(state, 'ia_status_filter', 'Tout') or 'Tout')
+        filtered = []
+        for item in state.ia_results:
+            # item = (score, path, is_ai, confidence, method, detection)
+            p_l = item[1].lower()
+            if state.ia_res_filter == 'Images' and not p_l.endswith(SUPPORTED_IMAGES): continue
+            if state.ia_res_filter == 'Vidéos' and not p_l.endswith(SUPPORTED_VIDEOS): continue
+            is_ai_v = item[2]
+            if status_filter == 'IA' and is_ai_v is not True: continue
+            if status_filter == 'Photo' and is_ai_v is not False: continue
+            if status_filter == 'Inconnu' and is_ai_v is not None: continue
+            if search_q:
+                name = os.path.basename(item[1]).lower()
+                method = str(item[4] or '').lower()
+                if search_q not in name and search_q not in method: continue
+            filtered.append(item)
+
+        if state.ia_sort == 'name_asc':
+            filtered.sort(key=lambda x: os.path.basename(x[1]).lower())
+        elif state.ia_sort == 'name_desc':
+            filtered.sort(key=lambda x: os.path.basename(x[1]).lower(), reverse=True)
+        elif state.ia_sort == 'score_asc':
+            filtered.sort(key=lambda x: x[0])
+        else:
+            filtered.sort(key=lambda x: x[0], reverse=True)
+
+        per_page = int(state.ia_per_page or 40)
+        total_pages = max(1, (len(filtered) + per_page - 1) // per_page)
+        if state.ia_page > total_pages: state.ia_page = 1
+
+        def change_page(d):
+            state.ia_page = max(1, min(total_pages, state.ia_page + d))
+            ia_gallery_ui.refresh()
+        def apply_filter(e):
+            state.ia_res_filter = e.value; state.ia_page = 1; ia_gallery_ui.refresh()
+        def apply_status(e):
+            state.ia_status_filter = e.value; state.ia_page = 1; ia_gallery_ui.refresh()
+        def apply_search(e):
+            state.ia_search = str(e.value or ''); state.ia_page = 1; ia_gallery_ui.refresh()
+        def apply_sort(e):
+            state.ia_sort = str(e.value or 'score'); state.ia_page = 1; ia_gallery_ui.refresh()
+        def apply_per_page(e):
+            state.ia_per_page = int(e.value or 40); state.ia_page = 1; ia_gallery_ui.refresh()
+
+        compact = bool(state.ia_compact)
+        _s_start = (state.ia_page - 1) * per_page
+        _page_paths_ia = [item[1] for item in filtered[_s_start:_s_start + per_page]]
+
+        with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
+            with ui.column().classes('w-full shrink-0 bg-gray-900 p-3 pb-2 border-b border-gray-800 z-20 gap-2 shadow-md'):
+                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg'):
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
+                        ui.button('Tout sélectionner', on_click=lambda: set_all('ia', True)).props('outline color=white dense')
+                        ui.button('Tout désélectionner', on_click=lambda: set_all('ia', False)).props('outline color=white dense')
+                        ui.button('Sél. page', on_click=lambda pp=_page_paths_ia: set_page_items('ia', True, pp)).props('outline color=cyan dense')
+                        ui.button('Désél. page', on_click=lambda pp=_page_paths_ia: set_page_items('ia', False, pp)).props('outline color=cyan dense')
+                        ui.toggle(['Tout', 'Images', 'Vidéos'], value=state.ia_res_filter, on_change=apply_filter).classes('text-xs ml-2')
+                        ui.toggle(['Tout', 'IA', 'Photo', 'Inconnu'], value=status_filter, on_change=apply_status).classes('text-xs ml-2')
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
+                        ui.button('Export HTML', icon='html', on_click=lambda: export_html_action('ia')).props('color=purple dense outline')
+                        ui.button('Copier ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'ia', False, False)).props('color=teal-800 dense')
+                        ui.button('Déplacer ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'ia', False, False)).props('color=red dense')
+                        ui.button('Supprimer ✔', icon='delete', on_click=lambda: delete_selected_media('ia')).props('color=red dense outline')
+
+                with ui.row().classes('w-full items-center gap-2 flex-wrap'):
+                    ui.input(placeholder='🔍 Rechercher nom / méthode…', value=state.ia_search, on_change=apply_search).props('dense outlined clearable').classes('flex-1 min-w-[160px] bg-gray-800 rounded')
+                    ui.select({'score': '↓ Score', 'score_asc': '↑ Score', 'name_asc': 'A→Z', 'name_desc': 'Z→A'}, value=state.ia_sort, label='Tri', on_change=apply_sort).props('dense outlined').classes('w-28')
+                    ui.select({20: '20/page', 40: '40/page', 100: '100/page'}, value=per_page, label='Par page', on_change=apply_per_page).props('dense outlined').classes('w-28')
+                    ui.button(icon='grid_view' if not compact else 'view_module', on_click=lambda: (setattr(state, 'ia_compact', not state.ia_compact), ia_gallery_ui.refresh())).props('flat round dense color=white').tooltip('Basculer vue compacte')
+                    ui.label(f'{len(filtered)} résultat(s)').classes('text-xs text-gray-400 ml-1')
+
+                with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
+                    ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
+                    ui.label(f'Page {state.ia_page} / {total_pages} ({len(filtered)} items)').classes('text-gray-300 font-bold text-sm')
+                    ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
+
+            scroll_id = 'ia_scroll_area'
+            with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
+                start_idx = (state.ia_page - 1) * per_page
+                page_items = filtered[start_idx : start_idx + per_page]
+                all_paths = [it[1] for it in filtered]
+
+                if not page_items:
+                    ui.label("Aucun fichier pour le filtre sélectionné.").classes("text-gray-400 m-4")
+
+                cols = int(state.grid_columns) + (3 if compact else 0)
+                gap_cls = 'w-full gap-1 pb-10' if compact else 'w-full gap-6 pb-10'
+                with ui.grid(columns=cols).classes(gap_cls):
+                    for score, path, is_ai_v, conf, method, _det in page_items:
+                        safe_path = urllib.parse.quote(path)
+                        global_index = all_paths.index(path)
+                        badge_text, badge_cls = _IA_BADGES.get(is_ai_v, _IA_BADGES[None])
+                        nsfw_tier = _read_nsfw_tier(path)
+                        card_bdr = f'border-2 {_NSFW_CARD_BORDER[nsfw_tier]}' if nsfw_tier else 'border border-gray-700'
+
+                        if compact:
+                            with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-cyan-500 transition-colors p-0 overflow-hidden relative'):
+                                with ui.row().classes('absolute top-1 left-1 bg-black/70 rounded px-0.5 z-10'):
+                                    ui.checkbox().bind_value(state.sel_ia, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'ia'), ['shiftKey']).props('dense size=xs')
+                                ui.label(badge_text).classes(f'absolute top-1 right-1 text-[9px] font-bold px-1 rounded border {badge_cls} z-10')
+                                with ui.context_menu():
+                                    ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
+                                    ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                    ui.menu_item('Ouvrir le dossier', on_click=lambda p=path: reveal_file_native(p))
+                                ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                                ui.label(os.path.basename(path)).classes('text-[9px] text-gray-400 truncate px-1 pb-0.5').tooltip(f'{method} · conf={conf:.2f}')
+                        else:
+                            with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-cyan-500 transition-colors p-0 overflow-hidden relative'):
+                                with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                    ui.checkbox().bind_value(state.sel_ia, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'ia'), ['shiftKey'])
+                                ui.label(badge_text).classes(f'absolute top-2 right-2 text-[10px] font-bold px-2 py-0.5 rounded border {badge_cls} z-10')
+                                with ui.context_menu():
+                                    ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
+                                    ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                    ui.menu_item('Ouvrir le dossier', on_click=lambda p=path: reveal_file_native(p))
+                                ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                                with ui.column().classes('w-full p-3 gap-2 bg-gray-800'):
+                                    ui.label(os.path.basename(path)).classes('text-sm text-cyan-300 font-bold truncate').tooltip(path)
+                                    ui.label(f'Méthode: {method or "—"}').classes('text-[10px] text-gray-400 truncate').tooltip(method or '')
+                                    ui.label(f'Confiance: {conf:.2f}  ·  Score: {score:.2f}').classes('text-xs text-gray-500')
+
+            ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=pink').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Haut de page')
+
     with ui.tab_panels(tabs).bind_value(state, 'current_tab').classes('w-full bg-[#121212] p-0'):
         
         # ВКЛАДКА 1: ПОИСК
@@ -6550,8 +7244,16 @@ def index_page():
                             state.is_processing = False
 
                     await run.io_bound(bg_task)
-                    face_gallery_ui.refresh()
-                    btn_face.enable()
+                    try:
+                        face_gallery_ui.refresh()
+                        state.add_log(f"[FACE] Galerie rafraîchie : {len(state.face_results)} résultat(s).")
+                    except Exception as _e:
+                        state.add_log(f"❌ Erreur affichage Visage : {_e}")
+                    finally:
+                        btn_face.enable()
+                        state.is_processing = False
+                        state.status_text = "Prêt !"
+                        state.progress = 1.0
                     
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
                     btn_face = ui.button('🕵️ Rechercher Visage', on_click=run_face_action).classes('w-full bg-teal-600 hover:bg-teal-500 font-bold text-lg')
@@ -6861,7 +7563,7 @@ def index_page():
 
                             if provider == 'ollama':
                                 # Toujours appeler ollama — tags passés en contexte si présents, sinon "none"
-                                return _ollama_raw_prompt(model, prompt_text, tags_dict), f'Ollama: {model}'
+                                return _ollama_raw_prompt(model, prompt_text, tags_dict, image_path=source_path), f'Ollama: {model}'
 
                             # Moteur local : prompt_text en priorité, tags en contexte secondaire
                             generated = prompt_text or (', '.join(list(tags_dict.keys())[:25]) if tags_dict else '')
@@ -6886,7 +7588,6 @@ def index_page():
                                 'tags_prompt_provider': provider,
                                 'tags_ollama_model': model,
                                 'tags_prompt_mode': mode,
-                                'tags_prompt_autosave_multi': bool(autosave_multi_switch.value),
                             })
                             _set_prompt_status('traitement prompt -> tags en cours...', busy=True)
                             state.add_log(f"[PROMPT] Conversion prompt -> tags démarrée ({int(selected_ctx['count'])} sélection(s)).")
@@ -6937,8 +7638,448 @@ def index_page():
                             finally:
                                 _finish_prompt_request(req_id)
 
+                        # ===== Wizard modal multi-photos =====
+                        # État partagé via closure (le widget UI est créé paresseusement la 1re fois)
+                        _wizard = {
+                            'queue': [],            # list[str] paths restants (tête = courant)
+                            'total': 0,
+                            'done': 0,
+                            'mode': 'both',         # snapshot du mode au démarrage du wizard
+                            'busy': False,
+                            'auto': False,          # True = auto-validate après chaque génération
+                            'dialog': None,         # ui.dialog instance
+                            'thumb': None,          # ui.image
+                            'title_label': None,    # ui.label
+                            'progress_label': None, # ui.label
+                            'raw_area': None,       # ui.textarea (mode raw / both)
+                            'detailed_area': None,  # ui.textarea (mode detailed / both)
+                            'single_area': None,    # ui.textarea (mode raw OR detailed seul)
+                            'raw_row': None,        # row container
+                            'detailed_row': None,
+                            'single_row': None,
+                            'status_label': None,
+                            'model_sel': None,      # ui.select override modèle
+                            'busy_bar': None,
+                        }
+
+                        def _wizard_build_dialog():
+                            if _wizard['dialog'] is not None:
+                                return
+                            with ui.dialog().props('persistent') as dlg, ui.card().classes('bg-gray-900 text-white w-[860px] max-w-[95vw] max-h-[92vh] overflow-auto'):
+                                _wizard['title_label'] = ui.label('Wizard prompt').classes('text-lg font-bold')
+                                _wizard['progress_label'] = ui.label('').classes('text-xs text-cyan-300 mb-1')
+                                with ui.row().classes('w-full gap-3 items-start'):
+                                    _wizard['thumb'] = ui.image('').classes('w-[280px] max-h-[280px] rounded border border-gray-700')
+                                    with ui.column().classes('flex-1 gap-2'):
+                                        # Override modèle (mêmes options que le select principal)
+                                        try:
+                                            _opts = list(getattr(ollama_tags_model_sel, 'options', None) or [])
+                                        except Exception:
+                                            _opts = []
+                                        _wizard['model_sel'] = ui.select(
+                                            options=_opts or [''],
+                                            value=(ollama_tags_model_sel.value if _opts else None),
+                                            label='Modèle Ollama (override)'
+                                        ).classes('w-full')
+                                        _wizard['status_label'] = ui.label('Statut: prêt').classes('text-xs text-gray-400')
+                                        _wizard['busy_bar'] = ui.linear_progress(value=None).props('indeterminate color=cyan').classes('w-full')
+                                        _wizard['busy_bar'].visible = False
+                                # Zones de texte (visibilité ajustée selon mode)
+                                _wizard['raw_row'] = ui.row().classes('w-full gap-2')
+                                with _wizard['raw_row']:
+                                    _wizard['raw_area'] = ui.textarea('Prompt brut', value='').props('autogrow filled').classes('w-full text-xs')
+                                _wizard['detailed_row'] = ui.row().classes('w-full gap-2')
+                                with _wizard['detailed_row']:
+                                    _wizard['detailed_area'] = ui.textarea('Prompt détaillé', value='').props('autogrow filled').classes('w-full text-xs')
+                                _wizard['single_row'] = ui.row().classes('w-full gap-2')
+                                with _wizard['single_row']:
+                                    _wizard['single_area'] = ui.textarea('Résultat', value='').props('autogrow filled').classes('w-full text-sm')
+                                # Boutons
+                                with ui.row().classes('w-full gap-2 mt-3 justify-end'):
+                                    ui.button('✖ Annuler', on_click=_wizard_cancel).props('flat color=red')
+                                    ui.button('⏭️ Passer', on_click=_wizard_skip).props('outline color=orange')
+                                    ui.button('🔄 Régénérer', on_click=_wizard_regenerate).props('outline color=cyan')
+                                    ui.button('✅ Valider et suivant', on_click=_wizard_validate).props('color=green')
+                            _wizard['dialog'] = dlg
+
+                        def _wizard_apply_mode_visibility():
+                            mode = str(_wizard['mode'] or 'both').strip().lower()
+                            try:
+                                if mode == 'both':
+                                    _wizard['raw_row'].visible = True
+                                    _wizard['detailed_row'].visible = True
+                                    _wizard['single_row'].visible = False
+                                elif mode == 'detailed':
+                                    _wizard['raw_row'].visible = False
+                                    _wizard['detailed_row'].visible = False
+                                    _wizard['single_row'].visible = True
+                                    _wizard['single_area'].props(remove='readonly')
+                                    _wizard['single_area'].label = 'Prompt détaillé'
+                                else:
+                                    _wizard['raw_row'].visible = False
+                                    _wizard['detailed_row'].visible = False
+                                    _wizard['single_row'].visible = True
+                                    _wizard['single_area'].label = 'Prompt brut'
+                                for r in (_wizard['raw_row'], _wizard['detailed_row'], _wizard['single_row']):
+                                    _safe_ui_call(r.update, 'wizard_row.update')
+                            except Exception as e:
+                                state.add_log(f"[WIZARD] visibility err: {e}")
+
+                        def _wizard_set_busy(busy: bool, status: str = ''):
+                            _wizard['busy'] = busy
+                            try:
+                                if _wizard['busy_bar'] is not None:
+                                    _wizard['busy_bar'].visible = busy
+                                    _safe_ui_call(_wizard['busy_bar'].update, 'wizard.busy_bar')
+                                if status and _wizard['status_label'] is not None:
+                                    _wizard['status_label'].set_text(f'Statut: {status}')
+                            except Exception:
+                                pass
+
+                        def _wizard_update_header():
+                            if not _wizard['queue']:
+                                return
+                            cur = _wizard['queue'][0]
+                            idx = _wizard['done'] + 1
+                            tot = _wizard['total']
+                            try:
+                                _wizard['title_label'].set_text(f"Photo {idx}/{tot} — {os.path.basename(cur)}")
+                                _wizard['progress_label'].set_text(cur)
+                                if cur.lower().endswith(SUPPORTED_IMAGES):
+                                    try:
+                                        _safe_url = urllib.parse.quote(cur)
+                                    except Exception:
+                                        _safe_url = cur
+                                    _wizard['thumb'].set_source(f'/media/{_safe_url}')
+                                    _wizard['thumb'].visible = True
+                                else:
+                                    _wizard['thumb'].visible = False
+                                _safe_ui_call(_wizard['thumb'].update, 'wizard.thumb')
+                            except Exception as e:
+                                state.add_log(f"[WIZARD] header err: {e}")
+
+                        async def _wizard_generate_current():
+                            if not _wizard['queue']:
+                                return
+                            cur = _wizard['queue'][0]
+                            _wizard_set_busy(True, f'génération pour {os.path.basename(cur)}...')
+                            try:
+                                single = _build_single_media_context(cur)
+                                base_prompt = str(single.get('base_prompt') or '')
+                                tags_dict = dict(single.get('tags') or {})
+                                ai_payload = dict(single.get('ai_payload') or {})
+                                shared_hint = str(prompt_query_input.value or '').strip()
+                                force_overwrite = bool(force_overwrite_metadata_switch.value)
+                                gen_prompt = shared_hint if force_overwrite else (shared_hint or base_prompt)
+                                provider = str(prompt_provider_sel.value or 'local').strip().lower()
+                                # Préfère le modèle override du wizard si présent
+                                model = ''
+                                if _wizard['model_sel'] is not None:
+                                    model = str(_wizard['model_sel'].value or '').strip()
+                                if not model:
+                                    model = str(ollama_tags_model_sel.value or '').strip()
+                                mode = _wizard['mode']
+
+                                # Mode 'both': générer brut + détaillé séparément
+                                if mode == 'both':
+                                    # Auto-skip si déjà existant en BD (sauf force_overwrite)
+                                    existing_raw = ''
+                                    existing_det = ''
+                                    if not force_overwrite:
+                                        try:
+                                            existing_raw = str((search_engine.db_cache.get_prompt(cur) or {}).get('text') or '').strip()
+                                            existing_det = str((search_engine.db_cache.get_detailed_prompt(cur) or {}).get('text') or '').strip()
+                                        except Exception:
+                                            pass
+                                    if existing_raw and not existing_det:
+                                        raw_text = existing_raw
+                                    else:
+                                        raw_out, _eng = await run.io_bound(_generate_prompt_sync, provider, model, 'raw', gen_prompt, tags_dict, ai_payload, cur)
+                                        raw_text = str(raw_out or '').strip()
+                                    if existing_det and not existing_raw:
+                                        det_text = existing_det
+                                    else:
+                                        det_out, _eng = await run.io_bound(_generate_prompt_sync, provider, model, 'detailed', gen_prompt, tags_dict, ai_payload, cur)
+                                        det_text = str(det_out or '').strip()
+                                    _wizard['raw_area'].value = raw_text
+                                    _wizard['detailed_area'].value = det_text
+                                    _safe_ui_call(_wizard['raw_area'].update, 'wizard.raw_area')
+                                    _safe_ui_call(_wizard['detailed_area'].update, 'wizard.detailed_area')
+                                else:
+                                    out, _eng = await run.io_bound(_generate_prompt_sync, provider, model, mode, gen_prompt, tags_dict, ai_payload, cur)
+                                    _wizard['single_area'].value = str(out or '').strip()
+                                    _safe_ui_call(_wizard['single_area'].update, 'wizard.single_area')
+                                _wizard_set_busy(False, 'prêt (vérifiez / éditez puis Validez)')
+                            except Exception as e:
+                                state.add_log(f"[WIZARD] gen err: {e}")
+                                _wizard_set_busy(False, f'erreur: {e}')
+                                _safe_notify(f'Erreur génération: {e}', 'negative')
+                                return
+                            # Mode auto : valider et passer automatiquement
+                            if _wizard.get('auto'):
+                                try:
+                                    await _wizard_validate()
+                                except Exception as ex:
+                                    state.add_log(f"[WIZARD] auto-validate err: {ex}")
+
+                        async def _open_prompt_wizard(paths):
+                            if not paths:
+                                return
+                            _wizard_build_dialog()
+                            _wizard['queue'] = list(paths)
+                            _wizard['total'] = len(paths)
+                            _wizard['done'] = 0
+                            _wizard['mode'] = str(prompt_mode_sel.value or 'both').strip().lower()
+                            _wizard['auto'] = str(prompt_wizard_mode_sel.value or 'manual').strip().lower() == 'auto'
+                            # Sync override-modèle avec le modèle principal
+                            try:
+                                _opts = list(getattr(ollama_tags_model_sel, 'options', None) or [])
+                                if _wizard['model_sel'] is not None:
+                                    _wizard['model_sel'].options = _opts or ['']
+                                    _wizard['model_sel'].value = ollama_tags_model_sel.value if _opts else None
+                                    _safe_ui_call(_wizard['model_sel'].update, 'wizard.model_sel')
+                            except Exception:
+                                pass
+                            _wizard_apply_mode_visibility()
+                            _wizard_update_header()
+                            state.add_log(f"[WIZARD] Démarré ({_wizard['total']} photos, mode={_wizard['mode']}).")
+                            _wizard['dialog'].open()
+                            await _wizard_generate_current()
+
+                        async def _wizard_regenerate():
+                            if _wizard['busy']:
+                                return
+                            await _wizard_generate_current()
+
+                        def _wizard_persist_current() -> bool:
+                            if not _wizard['queue']:
+                                return False
+                            cur = _wizard['queue'][0]
+                            provider = str(prompt_provider_sel.value or 'local').strip().lower()
+                            model = ''
+                            if _wizard['model_sel'] is not None:
+                                model = str(_wizard['model_sel'].value or '').strip()
+                            if not model:
+                                model = str(ollama_tags_model_sel.value or '').strip()
+                            source = f"ui_{provider}" + (f":{model}" if provider == 'ollama' and model else '')
+                            mode = _wizard['mode']
+                            try:
+                                if mode == 'both':
+                                    raw_txt = str(_wizard['raw_area'].value or '').strip()
+                                    det_txt = str(_wizard['detailed_area'].value or '').strip()
+                                    if raw_txt:
+                                        _persist_prompt_to_paths([cur], raw_txt, 'raw', source, allow_metadata_redirect=False)
+                                    if det_txt:
+                                        _persist_prompt_to_paths([cur], det_txt, 'detailed', source)
+                                    return bool(raw_txt or det_txt)
+                                else:
+                                    txt = str(_wizard['single_area'].value or '').strip()
+                                    if txt:
+                                        _persist_prompt_to_paths([cur], txt, mode, source)
+                                        return True
+                                    return False
+                            except Exception as e:
+                                state.add_log(f"[WIZARD] persist err: {e}")
+                                _safe_notify(f'Erreur sauvegarde: {e}', 'negative')
+                                return False
+
+                        def _wizard_refresh_gallery_for(path: str):
+                            # Met à jour le tuple correspondant dans state.prompt_results
+                            if not state.prompt_results:
+                                return
+                            try:
+                                for i, (score, p, ptext, dtext, psrc, dsrc) in enumerate(state.prompt_results):
+                                    if p == path:
+                                        new_p = search_engine.db_cache.get_prompt(p) or {}
+                                        new_d = search_engine.db_cache.get_detailed_prompt(p) or {}
+                                        ptext_new = str(new_p.get('text') or '').strip()
+                                        dtext_new = str(new_d.get('text') or '').strip()
+                                        psrc_new = str(new_p.get('source') or '').strip().lower()
+                                        dsrc_new = str(new_d.get('source') or '').strip().lower()
+                                        new_score = 0.0
+                                        if ptext_new:
+                                            new_score += min(len(ptext_new) / 240.0, 1.0)
+                                        if dtext_new:
+                                            new_score += 1.0
+                                        state.prompt_results[i] = (new_score, p, ptext_new, dtext_new, psrc_new, dsrc_new)
+                                        break
+                                state.prompt_results.sort(key=lambda x: x[0], reverse=True)
+                                prompt_gallery_ui.refresh()
+                            except Exception:
+                                pass
+
+                        async def _wizard_validate():
+                            if _wizard['busy'] or not _wizard['queue']:
+                                return
+                            cur = _wizard['queue'][0]
+                            ok = _wizard_persist_current()
+                            if ok:
+                                _wizard_refresh_gallery_for(cur)
+                                state.add_log(f"[WIZARD] Sauvegardé: {os.path.basename(cur)}")
+                            else:
+                                _safe_notify('Aucun texte à sauvegarder pour cette photo.', 'warning')
+                                return
+                            await _wizard_advance()
+
+                        async def _wizard_skip():
+                            if _wizard['busy'] or not _wizard['queue']:
+                                return
+                            state.add_log(f"[WIZARD] Passé: {os.path.basename(_wizard['queue'][0])}")
+                            await _wizard_advance()
+
+                        async def _wizard_advance():
+                            _wizard['queue'].pop(0)
+                            _wizard['done'] += 1
+                            if not _wizard['queue']:
+                                total = _wizard['total']
+                                _wizard['total'] = 0
+                                _wizard['done'] = 0
+                                try:
+                                    _wizard['dialog'].close()
+                                except Exception:
+                                    pass
+                                state.add_log(f"[WIZARD] Terminé: {total} photo(s) traitées.")
+                                _safe_notify(f'Wizard terminé: {total} photo(s) traitées.', 'positive')
+                                return
+                            # Vide les zones pour la photo suivante puis génère
+                            try:
+                                if _wizard['raw_area'] is not None: _wizard['raw_area'].value = ''
+                                if _wizard['detailed_area'] is not None: _wizard['detailed_area'].value = ''
+                                if _wizard['single_area'] is not None: _wizard['single_area'].value = ''
+                            except Exception:
+                                pass
+                            _wizard_update_header()
+                            await _wizard_generate_current()
+
+                        def _wizard_cancel():
+                            _wizard['queue'] = []
+                            _wizard['total'] = 0
+                            _wizard['done'] = 0
+                            try:
+                                _wizard['dialog'].close()
+                            except Exception:
+                                pass
+                            state.add_log("[WIZARD] Annulé par l'utilisateur.")
+                            _safe_notify('Wizard annulé.', 'info')
+
+                        async def _run_silent_prompt_batch(paths):
+                            """Génère et persiste les prompts pour `paths` sans aucun popup."""
+                            if not paths:
+                                return
+                            mode = str(prompt_mode_sel.value or 'both').strip().lower()
+                            provider = str(prompt_provider_sel.value or 'local').strip().lower()
+                            model = str(ollama_tags_model_sel.value or '').strip()
+                            force_overwrite = bool(force_overwrite_metadata_switch.value)
+                            shared_hint = str(prompt_query_input.value or '').strip()
+                            source = f"ui_{provider}" + (f":{model}" if provider == 'ollama' and model else '')
+                            total = len(paths)
+                            done = 0
+                            saved = 0
+                            errors = 0
+                            _set_prompt_status(f'batch silencieux : 0/{total}', busy=True)
+                            state.add_log(f"[PROMPT-BATCH] Démarrage silencieux: {total} photo(s), mode={mode}.")
+                            def _bg_one(cur: str):
+                                """Génère et persiste pour une photo. Retourne (saved_bool, err_str)."""
+                                try:
+                                    single = _build_single_media_context(cur)
+                                    base_prompt = str(single.get('base_prompt') or '')
+                                    tags_dict_l = dict(single.get('tags') or {})
+                                    ai_payload_l = dict(single.get('ai_payload') or {})
+                                    gen_prompt = shared_hint if force_overwrite else (shared_hint or base_prompt)
+                                    if mode == 'both':
+                                        existing_raw = ''
+                                        existing_det = ''
+                                        if not force_overwrite:
+                                            try:
+                                                existing_raw = str((search_engine.db_cache.get_prompt(cur) or {}).get('text') or '').strip()
+                                                existing_det = str((search_engine.db_cache.get_detailed_prompt(cur) or {}).get('text') or '').strip()
+                                            except Exception:
+                                                pass
+                                        if existing_raw and not existing_det:
+                                            raw_text = existing_raw
+                                        else:
+                                            raw_out, _e = _generate_prompt_sync(provider, model, 'raw', gen_prompt, tags_dict_l, ai_payload_l, cur)
+                                            raw_text = str(raw_out or '').strip()
+                                        if existing_det and not existing_raw:
+                                            det_text = existing_det
+                                        else:
+                                            det_out, _e = _generate_prompt_sync(provider, model, 'detailed', gen_prompt, tags_dict_l, ai_payload_l, cur)
+                                            det_text = str(det_out or '').strip()
+                                        did = False
+                                        if raw_text:
+                                            _persist_prompt_to_paths([cur], raw_text, 'raw', source, allow_metadata_redirect=False)
+                                            did = True
+                                        if det_text:
+                                            _persist_prompt_to_paths([cur], det_text, 'detailed', source)
+                                            did = True
+                                        return (did, '')
+                                    else:
+                                        out, _e = _generate_prompt_sync(provider, model, mode, gen_prompt, tags_dict_l, ai_payload_l, cur)
+                                        txt = str(out or '').strip()
+                                        if txt:
+                                            _persist_prompt_to_paths([cur], txt, mode, source)
+                                            return (True, '')
+                                        return (False, '')
+                                except Exception as ex:
+                                    return (False, repr(ex))
+                            for cur in list(paths):
+                                ok, err = await run.io_bound(_bg_one, cur)
+                                done += 1
+                                if ok:
+                                    saved += 1
+                                if err:
+                                    errors += 1
+                                    state.add_log(f"[PROMPT-BATCH] {os.path.basename(cur)}: {err}")
+                                try:
+                                    _set_prompt_batch_progress(f'{done}/{total} — {os.path.basename(cur)}')
+                                except Exception:
+                                    pass
+                                _set_prompt_status(f'batch silencieux : {done}/{total}', busy=True)
+                                # Met à jour la galerie au fil de l'eau
+                                try:
+                                    if state.prompt_results:
+                                        for i, (score, p, ptext, dtext, psrc, dsrc) in enumerate(state.prompt_results):
+                                            if p == cur:
+                                                new_p = search_engine.db_cache.get_prompt(p) or {}
+                                                new_d = search_engine.db_cache.get_detailed_prompt(p) or {}
+                                                ptext_new = str(new_p.get('text') or '').strip()
+                                                dtext_new = str(new_d.get('text') or '').strip()
+                                                psrc_new = str(new_p.get('source') or '').strip().lower()
+                                                dsrc_new = str(new_d.get('source') or '').strip().lower()
+                                                new_score = 0.0
+                                                if ptext_new: new_score += min(len(ptext_new) / 240.0, 1.0)
+                                                if dtext_new: new_score += 1.0
+                                                state.prompt_results[i] = (new_score, p, ptext_new, dtext_new, psrc_new, dsrc_new)
+                                                break
+                                except Exception:
+                                    pass
+                            try:
+                                state.prompt_results.sort(key=lambda x: x[0], reverse=True)
+                                prompt_gallery_ui.refresh()
+                            except Exception:
+                                pass
+                            _set_prompt_batch_progress('')
+                            _set_prompt_status(f'batch silencieux terminé : {saved}/{total} sauvegardé(s)' + (f', {errors} erreur(s)' if errors else ''), busy=False)
+                            state.add_log(f"[PROMPT-BATCH] Terminé: {saved}/{total} sauvegardé(s), {errors} erreur(s).")
+                            _safe_notify(
+                                f'Batch silencieux terminé : {saved}/{total} sauvegardé(s)' + (f' | {errors} erreur(s)' if errors else ''),
+                                'positive' if errors == 0 else 'warning'
+                            )
+
                         async def generate_prompt_action():
                             req_id = _start_prompt_request('gen')
+
+                            # Mode wizard multi-photos: si plus d'une photo sélectionnée
+                            _sel_now = _get_selected_prompt_paths()
+                            if len(_sel_now) > 1 and not _wizard['queue']:
+                                _finish_prompt_request(req_id)
+                                _wizard_mode = str(prompt_wizard_mode_sel.value or 'manual').strip().lower()
+                                if _wizard_mode == 'silent':
+                                    await _run_silent_prompt_batch(list(_sel_now))
+                                else:
+                                    await _open_prompt_wizard(list(_sel_now))
+                                return
+
                             shared_prompt_hint = str(prompt_query_input.value or '').strip()
                             user_tags_dict = {tag: 1.0 for tag in (pos_tags_sel.value or [])}
                             selected_ctx = _build_selected_media_context()
@@ -6960,7 +8101,6 @@ def index_page():
                                 'tags_prompt_provider': provider,
                                 'tags_ollama_model': model,
                                 'tags_prompt_mode': mode,
-                                'tags_prompt_autosave_multi': bool(autosave_multi_switch.value),
                             })
                             _set_prompt_status('génération du prompt en cours...', busy=True)
                             state.add_log(f"[PROMPT] Génération {('détaillée' if mode == 'detailed' else 'brute')} démarrée ({int(selected_ctx['count'])} sélection(s)).")
@@ -7002,119 +8142,58 @@ def index_page():
                                 if selected_ctx['count']:
                                     _set_prompt_status(f'génération basée sur {selected_ctx["count"]} photo(s) sélectionnée(s)...', busy=True)
 
-                                if bool(autosave_multi_switch.value) and int(selected_ctx.get('count', 0)) > 1 and selected_ctx.get('paths'):
-                                    source = f"auto_{provider}" + (f":{model}" if provider == 'ollama' and model else '')
-                                    saved = 0
-                                    errors = 0
-                                    last_engine = 'Local'
-                                    total = len(selected_ctx['paths'])
-                                    saved_names = []
-
-                                    for batch_index, path in enumerate(selected_ctx['paths'], start=1):
-                                        item_ctx = _build_single_media_context(path)
-                                        if force_overwrite:
-                                            # Ignore embedded metadata prompt, use only user hint + tags
-                                            item_prompt = shared_prompt_hint
-                                        else:
-                                            item_prompt = str(item_ctx.get('base_prompt') or '').strip()
-                                            if shared_prompt_hint:
-                                                item_prompt = f"{shared_prompt_hint}\n\n{item_prompt}".strip() if item_prompt else shared_prompt_hint
-
-                                        item_tags = dict(item_ctx['tags'] or {})
-                                        for tag, prob in (user_tags_dict or {}).items():
-                                            try:
-                                                tag_prob = float(prob)
-                                            except Exception:
-                                                tag_prob = 1.0
-                                            item_tags[tag] = max(float(item_tags.get(tag, 0.0)), tag_prob)
-                                        item_ai_payload = item_ctx['ai_payload'] if isinstance(item_ctx['ai_payload'], dict) else {}
-
-                                        # Ne passer que si pas de prompt ET pas de tags ET pas de chemin source
-                                        # (ollama peut générer à partir du nom de fichier seul)
-                                        if not item_prompt and not item_tags and not path:
-                                            errors += 1
-                                            _ollama_trace('ui.generate_prompt.batch.skip', path=path, reason='no_context_at_all')
-                                            continue
-
-                                        _set_prompt_status(f'génération batch {batch_index}/{total}', busy=True)
-                                        _set_prompt_batch_progress(f'Photo {batch_index}/{total}: {os.path.basename(path)}')
-                                        state.progress = batch_index / max(1, total)
-                                        try:
-                                            generated_item, last_engine = await run.io_bound(
-                                                _generate_prompt_sync,
-                                                provider,
-                                                model,
-                                                mode,
-                                                item_prompt,
-                                                item_tags,
-                                                item_ai_payload,
-                                                path,
-                                            )
-                                            generated_item = str(generated_item or '').strip()
-                                            if not generated_item:
-                                                errors += 1
-                                                _ollama_trace('ui.generate_prompt.batch.empty', path=path, mode=mode)
-                                                continue
-                                            item_saved, item_errors = _persist_prompt_to_paths([path], generated_item, mode, source)
-                                            saved += item_saved
-                                            errors += item_errors
-                                            if item_saved:
-                                                saved_names.append(os.path.basename(path))
-                                        except Exception as e:
-                                            errors += 1
-                                            _ollama_trace('ui.generate_prompt.batch.error', path=path, mode=mode, error=repr(e))
-
-                                        if _is_prompt_request_stale(req_id):
-                                            _ollama_trace('ui.generate_prompt.discarded', req_id=req_id, reason='cancelled_or_stale_during_batch')
-                                            _set_prompt_status('requête annulée (batch interrompu)', busy=False)
-                                            _set_prompt_batch_progress('')
-                                            return
-
-                                    elapsed = time.monotonic() - start_ts
-                                    preview_names = ', '.join(saved_names[:5]) if saved_names else ''
-                                    summary = f"Prompts sauvegardés individuellement pour {saved}/{total} photo(s)."
-                                    if preview_names:
-                                        summary += f"\nFichiers: {preview_names}"
-                                    if len(saved_names) > 5:
-                                        summary += f"\n... et {len(saved_names) - 5} autre(s)."
-                                    if errors:
-                                        summary += f"\nErreurs: {errors}"
-                                    generated_prompt_output.value = summary
-                                    _safe_ui_call(generated_prompt_output.update, 'generated_prompt_output.update')
-                                    _set_prompt_status(f'batch terminé en {elapsed:.1f}s ({saved}/{total} sauvegardé(s))', busy=False)
-                                    _set_prompt_batch_progress('')
-                                    state.add_log(f"[PROMPT] Batch terminé en {elapsed:.1f}s: {saved}/{total} sauvegardé(s), {errors} erreur(s).")
-                                    _ollama_trace('ui.generate_prompt.batch.done', req_id=req_id, elapsed_s=f"{elapsed:.2f}", saved=saved, errors=errors, engine=last_engine)
-                                    _safe_notify(
-                                        f'Prompts {"détaillés" if mode == "detailed" else "bruts"} générés individuellement pour {saved} photo(s).' + (f' ({errors} erreur(s))' if errors else ''),
-                                        'positive' if errors == 0 else 'warning'
-                                    )
-                                    return
+                                # Auto-détection en mode 'both': ne génère que ce qui manque pour l'image active
+                                skip_raw = False
+                                skip_detailed = False
+                                existing_raw_text = ''
+                                existing_detailed_text = ''
+                                if mode == 'both' and source_path and not force_overwrite:
+                                    try:
+                                        _existing_raw = search_engine.db_cache.get_prompt(source_path) or {}
+                                        existing_raw_text = str(_existing_raw.get('text') or '').strip()
+                                        _existing_det = search_engine.db_cache.get_detailed_prompt(source_path) or {}
+                                        existing_detailed_text = str(_existing_det.get('text') or '').strip()
+                                        # Si UN seul des deux existe, ne régénérer que le manquant
+                                        if existing_raw_text and not existing_detailed_text:
+                                            skip_raw = True
+                                        elif existing_detailed_text and not existing_raw_text:
+                                            skip_detailed = True
+                                        # Si les deux existent: régénérer les deux (l'utilisateur a explicitement demandé)
+                                    except Exception:
+                                        pass
 
                                 # Gestion du mode "both": générer brut ET détaillé
                                 if mode == 'both':
-                                    generated_raw, engine_raw = await run.io_bound(
-                                        _generate_prompt_sync,
-                                        provider,
-                                        model,
-                                        'raw',
-                                        generation_prompt_text,
-                                        tags_dict,
-                                        ai_payload,
-                                        source_path,
-                                    )
+                                    if skip_raw:
+                                        generated_raw, engine_raw = existing_raw_text, 'existant (BD)'
+                                        _ollama_trace('ui.generate_prompt.both.skip_raw', path=source_path)
+                                    else:
+                                        generated_raw, engine_raw = await run.io_bound(
+                                            _generate_prompt_sync,
+                                            provider,
+                                            model,
+                                            'raw',
+                                            generation_prompt_text,
+                                            tags_dict,
+                                            ai_payload,
+                                            source_path,
+                                        )
                                     generated_raw = str(generated_raw or '').strip()
-                                    
-                                    generated_detailed, engine_detailed = await run.io_bound(
-                                        _generate_prompt_sync,
-                                        provider,
-                                        model,
-                                        'detailed',
-                                        generation_prompt_text,
-                                        tags_dict,
-                                        ai_payload,
-                                        source_path,
-                                    )
+
+                                    if skip_detailed:
+                                        generated_detailed, engine_detailed = existing_detailed_text, 'existant (BD)'
+                                        _ollama_trace('ui.generate_prompt.both.skip_detailed', path=source_path)
+                                    else:
+                                        generated_detailed, engine_detailed = await run.io_bound(
+                                            _generate_prompt_sync,
+                                            provider,
+                                            model,
+                                            'detailed',
+                                            generation_prompt_text,
+                                            tags_dict,
+                                            ai_payload,
+                                            source_path,
+                                        )
                                     generated_detailed = str(generated_detailed or '').strip()
                                     
                                     if not generated_raw and not generated_detailed:
@@ -7185,7 +8264,7 @@ def index_page():
                             finally:
                                 _finish_prompt_request(req_id)
 
-                        def _persist_prompt_to_paths(paths, prompt_text, mode, source):
+                        def _persist_prompt_to_paths(paths, prompt_text, mode, source, allow_metadata_redirect=True):
                             saved = 0
                             errors = 0
                             for path in (paths or []):
@@ -7197,17 +8276,27 @@ def index_page():
                                         existing_source = str(existing_prompt.get('source') or '').strip().lower()
                                         # Check if we should force overwrite metadata prompts
                                         force_overwrite = bool(force_overwrite_metadata_switch.value)
-                                        if existing_source.startswith('image_metadata') and not force_overwrite:
+                                        if allow_metadata_redirect and existing_source.startswith('image_metadata') and not force_overwrite:
                                             search_engine.db_cache.save_detailed_prompt(path, prompt_text, source=f"raw:{source}")
                                         else:
                                             search_engine.db_cache.save_prompt(path, prompt_text, source=source)
+                                    # Écriture systématique du sidecar TXT (détaillé prioritaire sur brut)
+                                    try:
+                                        det_after = (search_engine.db_cache.get_detailed_prompt(path) or {}).get('text') or ''
+                                        raw_after = (search_engine.db_cache.get_prompt(path) or {}).get('text') or ''
+                                        best_txt = str(det_after).strip() or str(raw_after).strip()
+                                        if best_txt:
+                                            p_obj = Path(path)
+                                            p_obj.with_name(f"{p_obj.stem}_prompt.txt").write_text(best_txt, encoding='utf-8')
+                                    except Exception as _txt_e:
+                                        _ollama_trace('ui.save_prompt_txt.error', path=path, mode=mode, error=repr(_txt_e))
                                     saved += 1
                                 except Exception as e:
                                     errors += 1
                                     _ollama_trace('ui.save_prompt.error', path=path, mode=mode, error=repr(e))
                             return saved, errors
 
-                        def save_generated_prompt_action():
+                        async def save_generated_prompt_action():
                             mode = str(prompt_mode_sel.value or 'raw').strip().lower()
                             
                             # Récupérer le/les texte(s) généré(s)
@@ -7227,11 +8316,11 @@ def index_page():
 
                             selected_paths = _get_selected_prompt_paths()
                             if not selected_paths:
-                                return _safe_notify('Sélectionnez au least une photo dans la galerie Prompt.', 'warning')
+                                return _safe_notify('Sélectionnez au moins une photo dans la galerie Prompt.', 'warning')
 
                             if mode == 'both':
-                                # Sauvegarder les deux prompts
-                                saved_raw, errors_raw = _persist_prompt_to_paths(selected_paths, generated_text_raw, 'raw', source) if generated_text_raw else (0, 0)
+                                # Sauvegarder les deux prompts (sans redirection raw->detailed)
+                                saved_raw, errors_raw = _persist_prompt_to_paths(selected_paths, generated_text_raw, 'raw', source, allow_metadata_redirect=False) if generated_text_raw else (0, 0)
                                 saved_detailed, errors_detailed = _persist_prompt_to_paths(selected_paths, generated_text_detailed, 'detailed', source) if generated_text_detailed else (0, 0)
                                 saved = saved_raw + saved_detailed
                                 errors = errors_raw + errors_detailed
@@ -7449,17 +8538,13 @@ def index_page():
                             detailed_source = ''
 
                         # Load prompts from .txt sidecar files if present and not already cached
-                        p = Path(path)
-                        txt_path = p.with_name(f"{p.stem}_prompt.txt")
-                        if txt_path.exists():
-                            try:
-                                txt_content = txt_path.read_text(encoding='utf-8').strip()
-                                if txt_content and not prompt_text:
-                                    prompt_text = txt_content
-                                    prompt_source = 'file_sidecar'
-                                    search_engine.db_cache.save_prompt(path, txt_content, source='file_sidecar')
-                            except Exception:
-                                pass
+                        # Conventions: `{stem}_prompt.txt` ou `{stem}.txt` (SD WebUI / kohya)
+                        if not prompt_text:
+                            txt_content = TagEngine._read_sidecar_prompt_txt(path)
+                            if txt_content:
+                                prompt_text = txt_content
+                                prompt_source = 'file_sidecar'
+                                search_engine.db_cache.save_prompt(path, txt_content, source='file_sidecar')
 
                         # Restore the embedded source prompt if a generated raw prompt replaced it earlier.
                         if path.lower().endswith(SUPPORTED_IMAGES):
@@ -7660,14 +8745,25 @@ def index_page():
                         res.sort(key=lambda x: x[0], reverse=True)
                         return res
 
-                    res = await run.io_bound(process_search, dir_val, exts, cache_key, thres_val, pos_val, neg_val)
-                    
-                    state.tags_results = res
-                    state.sel_tags = {p: False for s, p, t in res}
-                    tags_gallery_ui.refresh()
-                    _update_tags_primary_button()
-                    btn_search_tags.enable()
-                    state.is_processing = False
+                    res = None
+                    try:
+                        res = await run.io_bound(process_search, dir_val, exts, cache_key, thres_val, pos_val, neg_val)
+                    except Exception as _e:
+                        state.add_log(f"❌ Erreur recherche Tags : {_e}")
+
+                    try:
+                        state.tags_results = res if res is not None else []
+                        state.sel_tags = {p: False for s, p, t in state.tags_results}
+                        tags_gallery_ui.refresh()
+                        _update_tags_primary_button()
+                        state.add_log(f"[TAGS] Recherche terminée : {len(state.tags_results)} résultat(s).")
+                    except Exception as _e:
+                        state.add_log(f"❌ Erreur affichage résultats Tags : {_e}")
+                    finally:
+                        btn_search_tags.enable()
+                        state.is_processing = False
+                        state.status_text = "Prêt !"
+                        state.progress = 1.0
 
                 async def load_txt_tags_action():
                     if not tags_dir.value:
@@ -7776,9 +8872,12 @@ def index_page():
                         provider_default = str(cfg.get('tags_prompt_provider', 'local') or 'local').strip().lower()
                         if provider_default not in ('local', 'ollama'):
                             provider_default = 'local'
-                        mode_default = str(cfg.get('tags_prompt_mode', 'raw') or 'raw').strip().lower()
-                        if mode_default not in ('raw', 'detailed'):
-                            mode_default = 'raw'
+                        mode_default = str(cfg.get('tags_prompt_mode', 'both') or 'both').strip().lower()
+                        if mode_default not in ('raw', 'detailed', 'both'):
+                            mode_default = 'both'
+                        wizard_mode_default = str(cfg.get('tags_prompt_wizard_mode', 'manual') or 'manual').strip().lower()
+                        if wizard_mode_default not in ('manual', 'auto', 'silent'):
+                            wizard_mode_default = 'manual'
 
                         prompt_provider_sel = ui.select(
                             {'local': 'Moteur local', 'ollama': 'Ollama'},
@@ -7796,18 +8895,32 @@ def index_page():
                             placeholder='Entrez un prompt positif ou une description. Vous pouvez ensuite convertir en tags ou générer un prompt.'
                         ).props('autogrow filled').classes('w-full')
                         prompt_mode_sel = ui.select(
-                            {'raw': 'Prompt brut', 'detailed': 'Prompt détaillé', 'both': 'Les deux'},
+                            {'raw': 'Prompt brut', 'detailed': 'Prompt détaillé', 'both': 'Les deux (auto: ne génère que ce qui manque)'},
                             value=mode_default,
                             label='Type de prompt'
                         ).classes('w-full')
-                        autosave_multi_switch = ui.switch(
-                            'Auto-sauvegarde multi-photos',
-                            value=bool(cfg.get('tags_prompt_autosave_multi', True))
-                        ).classes('w-full text-sm text-gray-300')
                         force_overwrite_metadata_switch = ui.switch(
                             '🔄 Écraser les métadonnées',
                             value=False
                         ).classes('w-full text-sm text-gray-300').tooltip('Force l\'écrasement du prompt image_metadata existant')
+
+                        prompt_wizard_mode_sel = ui.select(
+                            {
+                                'manual': '👁️ Manuel — popup + validation à chaque photo',
+                                'auto':   '⏩ Auto — popup visible, validation automatique',
+                                'silent': '🤖 Silencieux — batch en arrière-plan, sans popup',
+                            },
+                            value=wizard_mode_default,
+                            label='Mode wizard multi-photos',
+                        ).classes('w-full').tooltip(
+                            'Lorsque plusieurs photos sont sélectionnées :\n'
+                            '• Manuel : tu valides chaque photo dans le popup\n'
+                            '• Auto : le popup défile, validation auto à chaque génération\n'
+                            '• Silencieux : aucun popup, traitement direct'
+                        )
+                        prompt_wizard_mode_sel.on_value_change(
+                            lambda e: save_config({'tags_prompt_wizard_mode': str(e.value or 'manual')})
+                        )
                         
                         # Affichage conditionnel: une ou deux textbox selon le mode
                         with ui.column().classes('w-full gap-2'):
@@ -7973,11 +9086,299 @@ def index_page():
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
                 prompt_gallery_ui()
 
+        # ВКЛАДКА: ДЕТЕКТОР IA
+        with ui.tab_panel(tab_ia).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
+            with ui.column().classes('w-[350px] shrink-0 bg-gray-900 rounded-xl border border-gray-800 shadow-lg flex flex-col overflow-hidden p-0 gap-0'):
+                with ui.row().classes('w-full p-4 pb-2 shrink-0 border-b border-gray-800 bg-gray-900 z-10'):
+                    ui.label('Détecteur IA').classes('text-lg font-bold')
+
+                with ui.column().classes('w-full flex-1 overflow-y-auto p-4 gap-2 min-h-0'):
+                    with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
+                        ia_dir = ui.input('Dossier', value=cfg.get('ia_dir', cfg.get('prompt_dir', ''))).classes('flex-grow')
+                        ui.button(icon='folder', on_click=lambda: select_folder(ia_dir)).props('flat round dense')
+                        ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache(ia_dir.value)).props('flat round dense text-color=red').tooltip('Effacer l\'index du dossier')
+
+                    ui.label('Détecte si une image est générée par IA (3 passes : signatures de générateur, EXIF caméra, vision Ollama).').classes('text-xs text-gray-400')
+
+                    with ui.expansion('Options Ollama (fallback vision)', icon='psychology', value=True).classes('w-full bg-gray-800/50 rounded-lg border border-pink-800 mt-3'):
+                        ia_ollama_options = list(cfg.get('ollama_models_cached', []) or [])
+                        ia_ollama_default = str(cfg.get('ia_ollama_model', cfg.get('tags_ollama_model', '')) or '').strip()
+                        if ia_ollama_default not in ia_ollama_options:
+                            ia_ollama_default = ia_ollama_options[0] if ia_ollama_options else None
+                        ia_ollama_model_sel = ui.select(
+                            ia_ollama_options,
+                            value=ia_ollama_default,
+                            label='Modèle Ollama (vision)'
+                        ).classes('w-full')
+                        ia_use_ollama = ui.switch('Utiliser Ollama en fallback', value=bool(cfg.get('ia_use_ollama', False))).classes('w-full text-sm text-pink-300')
+                        ia_write_sidecar_auto = ui.switch('Écrire .ia sidecar à la détection', value=bool(cfg.get('ia_write_sidecar_auto', True))).classes('w-full text-sm text-gray-300')
+                        ia_force_recompute = ui.switch('🔄 Recalculer même si déjà en cache', value=False).classes('w-full text-sm text-amber-300')
+
+                        async def ia_refresh_ollama_models_action():
+                            try:
+                                models = await run.io_bound(_ollama_list_models)
+                                ia_ollama_model_sel.options = models
+                                if ia_ollama_model_sel.value not in models:
+                                    ia_ollama_model_sel.value = models[0] if models else None
+                                ia_ollama_model_sel.update()
+                                ui.notify(f'{len(models)} modèle(s) Ollama trouvé(s)', type='positive')
+                            except Exception as e:
+                                ui.notify(f'Erreur Ollama: {e}', type='negative')
+
+                        ui.button('🔄 Actualiser modèles Ollama', on_click=ia_refresh_ollama_models_action).props('outline color=pink size=sm').classes('w-full')
+
+                    ia_status_label = ui.label('Statut: prêt').classes('text-xs text-gray-400 mt-2')
+                    ia_progress_label = ui.label('').classes('text-xs text-pink-300')
+                    ia_busy_bar = ui.linear_progress(value=None).props('indeterminate color=pink').classes('w-full')
+                    ia_busy_bar.visible = False
+
+                    def _ia_set_status(text, busy=False):
+                        try:
+                            ia_status_label.text = f'Statut: {text}'
+                            ia_status_label.update()
+                            ia_busy_bar.visible = busy
+                            ia_busy_bar.update()
+                        except Exception:
+                            pass
+
+                    def _ia_set_progress(text):
+                        try:
+                            ia_progress_label.text = text
+                            ia_progress_label.update()
+                        except Exception:
+                            pass
+
+                def _load_all_ia_results(directory):
+                    """Charge tous les résultats de détection IA du dossier (cache + sidecar).
+
+                    Force toujours un re-scan disque : l'utilisateur a explicitement
+                    cliqué pour lire le dossier, on ne se fie pas au dir_cache.json
+                    qui peut être obsolète après un déplacement/copie d'organizator.
+                    """
+                    all_files = search_engine._gather_files(directory, SUPPORTED_IMAGES, force_rescan=True)
+                    seen, unique = set(), []
+                    for path in all_files:
+                        k = os.path.normcase(os.path.normpath(os.path.realpath(path)))
+                        if k in seen: continue
+                        seen.add(k); unique.append(path)
+                    out = []
+                    for path in unique:
+                        det = search_engine.db_cache.get_ai_detection(path)
+                        if det is None:
+                            # Tente sidecar .ia
+                            side = TagEngine._read_sidecar_ia(path)
+                            if side and side.get('is_ai') is not None:
+                                search_engine.db_cache.save_ai_detection(
+                                    path,
+                                    bool(side.get('is_ai')),
+                                    float(side.get('confidence', 0.0) or 0.0),
+                                    str(side.get('method', 'sidecar')),
+                                    side,
+                                )
+                                det = search_engine.db_cache.get_ai_detection(path)
+                        if det is None:
+                            # Pas encore analysé : entrée "Inconnu"
+                            out.append((0.0, path, None, 0.0, '', {}))
+                        else:
+                            is_ai_v = det.get('is_ai')
+                            conf = float(det.get('confidence', 0.0) or 0.0)
+                            # Score d'affichage : confiance, inversée pour photo (les + sûres en haut quand "↓ Score")
+                            score = conf if is_ai_v else (conf * 0.5)
+                            out.append((score, path, is_ai_v, conf, str(det.get('method', '')), det.get('detection', {})))
+                    return out
+
+                async def load_ia_action(force_reindex: bool = False):
+                    save_config({
+                        'ia_dir': ia_dir.value,
+                        'ia_ollama_model': ia_ollama_model_sel.value,
+                        'ia_use_ollama': bool(ia_use_ollama.value),
+                        'ia_write_sidecar_auto': bool(ia_write_sidecar_auto.value),
+                    })
+                    if not ia_dir.value:
+                        return ui.notify('Indiquez un dossier !', type='warning')
+                    btn_ia_primary.disable(); btn_ia_reload.disable()
+                    _ia_set_status('lecture du cache et sidecars .ia…', busy=True)
+                    _ia_set_progress('')
+                    if force_reindex:
+                        # Re-scan disque + vider le cache IA pour ces fichiers
+                        def _purge():
+                            files = search_engine._gather_files(ia_dir.value, SUPPORTED_IMAGES, force_rescan=True)
+                            for fp in files:
+                                try: search_engine.db_cache.delete_ai_detection(fp)
+                                except Exception: pass
+                            return len(files)
+                        n = await run.io_bound(_purge)
+                        state.add_log(f"[IA] Cache disque + détection IA purgés pour {n} fichier(s).")
+                    loaded = await run.io_bound(_load_all_ia_results, ia_dir.value)
+                    state.ia_base_dir = ia_dir.value
+                    state.ia_results = loaded
+                    state.sel_ia = {p: False for _s, p, *_ in loaded}
+                    state.ia_page = 1
+                    ia_gallery_ui.refresh()
+                    btn_ia_primary.enable(); btn_ia_reload.enable()
+                    _ia_set_status(f'{len(loaded)} média(s) listé(s)', busy=False)
+                    state.add_log(f"[IA] Galerie chargée : {len(loaded)} média(s).")
+
+                async def detect_ia_action(only_unknown: bool = False):
+                    """Lance la détection IA sur les fichiers sélectionnés (ou tous les inconnus)."""
+                    if not state.ia_results:
+                        return ui.notify("Charge d'abord le dossier.", type='warning')
+                    if only_unknown:
+                        targets = [p for _s, p, is_ai_v, *_ in state.ia_results if is_ai_v is None]
+                    else:
+                        targets = [p for p, v in state.sel_ia.items() if v]
+                        if not targets:
+                            return ui.notify('Rien de sélectionné. Astuce: bouton « Détecter tous les inconnus » à droite.', type='warning')
+                    if not targets:
+                        return ui.notify('Aucun fichier à traiter.', type='info')
+                    ollama_model = str(ia_ollama_model_sel.value or '').strip()
+                    use_ollama = bool(ia_use_ollama.value)
+                    if use_ollama and not ollama_model:
+                        ui.notify('Aucun modèle Ollama choisi : fallback désactivé pour ce run.', type='warning')
+                        use_ollama = False
+                    write_sidecar = bool(ia_write_sidecar_auto.value)
+                    force = bool(ia_force_recompute.value)
+                    btn_ia_detect_sel.disable(); btn_ia_detect_unknown.disable()
+                    _ia_set_status(f'détection IA en cours sur {len(targets)} fichier(s)…', busy=True)
+
+                    def _bg():
+                        done = 0
+                        for fp in targets:
+                            try:
+                                if not force:
+                                    cached = search_engine.db_cache.get_ai_detection(fp)
+                                    if cached is not None and cached.get('is_ai') is not None:
+                                        done += 1
+                                        msg = f'{done}/{len(targets)} (cache hit) — {os.path.basename(fp)}'
+                                        _safe_ui_call(lambda m=msg: _ia_set_progress(m), 'ia_progress.cache')
+                                        continue
+                                res = run_ai_detection(fp, ollama_model=ollama_model, use_ollama_fallback=use_ollama)
+                                if res.get('is_ai') is not None:
+                                    search_engine.db_cache.save_ai_detection(
+                                        fp,
+                                        bool(res['is_ai']),
+                                        float(res.get('confidence', 0.0) or 0.0),
+                                        str(res.get('method', '')),
+                                        res,
+                                    )
+                                    if write_sidecar:
+                                        TagEngine._write_sidecar_ia(fp, res)
+                                done += 1
+                                msg = f'{done}/{len(targets)} — {os.path.basename(fp)} → {res.get("method","")}'
+                                _safe_ui_call(lambda m=msg: _ia_set_progress(m), 'ia_progress.update')
+                            except Exception as e:
+                                state.add_log(f"[IA] Erreur sur {fp}: {e}")
+                        return done
+
+                    n_done = await run.io_bound(_bg)
+                    _ia_verdict_cache.clear()
+                    # Recharger les résultats
+                    loaded = await run.io_bound(_load_all_ia_results, state.ia_base_dir or ia_dir.value)
+                    state.ia_results = loaded
+                    state.sel_ia = {p: state.sel_ia.get(p, False) for _s, p, *_ in loaded}
+                    ia_gallery_ui.refresh()
+                    btn_ia_detect_sel.enable(); btn_ia_detect_unknown.enable()
+                    _ia_set_status(f'terminé : {n_done} fichier(s) traité(s)', busy=False)
+                    _ia_set_progress('')
+                    state.add_log(f"[IA] Détection terminée : {n_done} fichier(s).")
+
+                async def write_ia_sidecars_action():
+                    """Écrit les sidecars .ia pour la sélection (ou tous ceux qui ont un verdict)."""
+                    targets = [p for p, v in state.sel_ia.items() if v]
+                    if not targets:
+                        # Tous ceux avec verdict
+                        targets = [p for _s, p, is_ai_v, *_ in state.ia_results if is_ai_v is not None]
+                    if not targets:
+                        return ui.notify('Aucun verdict à écrire.', type='warning')
+                    def _bg():
+                        n = 0
+                        for fp in targets:
+                            det = search_engine.db_cache.get_ai_detection(fp)
+                            if det is None or det.get('is_ai') is None: continue
+                            payload = det.get('detection') or {
+                                'is_ai': det.get('is_ai'),
+                                'confidence': det.get('confidence'),
+                                'method': det.get('method'),
+                                'detected_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                            }
+                            if TagEngine._write_sidecar_ia(fp, payload):
+                                n += 1
+                        return n
+                    n_done = await run.io_bound(_bg)
+                    ui.notify(f'{n_done} sidecar(s) .ia écrit(s)', type='positive')
+                    state.add_log(f"[IA] {n_done} sidecar(s) .ia écrit(s).")
+
+                async def manual_mark_action(verdict):
+                    """Force un verdict (True=IA, False=Photo, None=Inconnu) sur la sélection.
+                    Met à jour le cache, écrit le sidecar .ia si activé, puis rafraîchit la galerie."""
+                    targets = [p for p, v in state.sel_ia.items() if v]
+                    if not targets:
+                        return ui.notify('Aucune sélection.', type='warning')
+                    write_sidecar = bool(ia_write_sidecar_auto.value)
+                    label = '🤖 IA' if verdict is True else ('📷 Photo' if verdict is False else '❓ Inconnu')
+                    def _bg():
+                        n = 0
+                        for fp in targets:
+                            try:
+                                if verdict is None:
+                                    # Effacer le verdict : suppression du cache + sidecar
+                                    search_engine.db_cache.delete_ai_detection(fp)
+                                    try:
+                                        sp = os.path.splitext(fp)[0] + '.ia'
+                                        if os.path.exists(sp): os.remove(sp)
+                                    except Exception: pass
+                                else:
+                                    payload = {
+                                        'is_ai': bool(verdict),
+                                        'confidence': 1.0,
+                                        'method': 'manual_override',
+                                        'detected_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                                    }
+                                    search_engine.db_cache.save_ai_detection(fp, bool(verdict), 1.0, 'manual_override', payload)
+                                    if write_sidecar:
+                                        TagEngine._write_sidecar_ia(fp, payload)
+                                n += 1
+                            except Exception as ex:
+                                state.add_log(f"[IA] manual_mark {fp}: {ex}")
+                        return n
+                    _ia_set_status(f'marquage {label} en cours...', busy=True)
+                    n_done = await run.io_bound(_bg)
+                    _ia_verdict_cache.clear()
+                    # Recharge la liste pour refléter
+                    loaded = await run.io_bound(_load_all_ia_results, state.ia_base_dir or ia_dir.value)
+                    state.ia_results = loaded
+                    state.sel_ia = {p: state.sel_ia.get(p, False) for _s, p, *_ in loaded}
+                    state.ia_page = 1
+                    _ia_set_status(f'{n_done} fichier(s) marqué(s) {label}', busy=False)
+                    ui.notify(f'{n_done} fichier(s) → {label}', type='positive')
+                    state.add_log(f"[IA] {n_done} fichier(s) marqué(s) manuellement {label}.")
+                    _refresh_gallery('ia')
+
+                with ui.row().classes('w-full gap-2 mt-2'):
+                    btn_ia_detect_sel = ui.button('🔍 Détecter (sélection)', on_click=lambda: detect_ia_action(False)).props('outline color=pink size=sm').classes('flex-grow')
+                    btn_ia_detect_unknown = ui.button('❓ Détecter tous les inconnus', on_click=lambda: detect_ia_action(True)).props('outline color=amber size=sm').classes('flex-grow')
+                ui.separator().classes('my-2 bg-gray-700')
+                ui.label('Marquage manuel (sélection)').classes('text-xs text-gray-400 uppercase')
+                with ui.row().classes('w-full gap-2'):
+                    ui.button('🤖 Marquer IA', on_click=lambda: manual_mark_action(True)).props('color=pink size=sm').classes('flex-grow').tooltip('Force le verdict IA sur la sélection')
+                    ui.button('📷 Marquer Photo', on_click=lambda: manual_mark_action(False)).props('color=emerald size=sm').classes('flex-grow').tooltip('Force le verdict Photo réelle sur la sélection')
+                with ui.row().classes('w-full gap-2'):
+                    ui.button('❓ Effacer verdict', on_click=lambda: manual_mark_action(None)).props('outline color=gray size=sm').classes('flex-grow').tooltip('Supprime le verdict (cache + sidecar) — repassera en Inconnu')
+                    ui.button('💾 Écrire .ia (sélection)', on_click=write_ia_sidecars_action).props('outline color=teal size=sm').classes('flex-grow')
+
+                with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10 gap-2'):
+                    btn_ia_reload = ui.button('♻️ Vider et recharger', on_click=lambda: load_ia_action(True)).classes('w-full bg-orange-700 hover:bg-orange-600 font-bold').tooltip('Vide le cache IA et relit le dossier')
+                    btn_ia_primary = ui.button('🖼️ Lire les images', on_click=lambda: load_ia_action(False)).classes('w-full bg-pink-700 hover:bg-pink-600 font-bold')
+
+            with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
+                ia_gallery_ui()
+
         # ВКЛАДКА 6: ИНДЕКСАТОР (Кэш)
         with ui.tab_panel(tab_cache).classes('w-full h-[calc(100vh-115px)] p-8 flex flex-col items-center overflow-y-auto pb-24'):
             with ui.card().classes('w-full max-w-[600px] p-6 flex flex-col gap-4 bg-gray-900 border border-gray-800 shrink-0 mb-12 mt-4'):
                 ui.label('Indexation de masse (pre-cache)').classes('text-xl font-bold text-blue-400')
                 ui.label('Utilisez ceci pour pre-analyser tout le dossier sans lancer de recherche. Tous les signaux IA seront sauvegardes en base.').classes('text-gray-400 text-sm')
+                ui.label("✅ Détection auto des nouveaux fichiers : relancez après organizator, seuls les nouveaux médias seront traités (les médias déjà en cache sont sautés).").classes('text-green-400 text-xs italic')
                 
                 with ui.row().classes('w-full items-center gap-2 mt-2'):
                     cache_dir = ui.input('Dossier a indexer', value=cfg.get('cache_dir', '')).classes('flex-grow')

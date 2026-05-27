@@ -64,7 +64,7 @@ try:
 except ImportError:
     pass
 
-from nicegui import app, ui, run
+from nicegui import app, ui, run, background_tasks
 
 try:
     from send2trash import send2trash
@@ -997,6 +997,30 @@ class DiskScanner:
             norm_candidate = os.path.normcase(candidate_path)
 
             if cext == ".txt":
+                # Essai 1 : stem exact (ex: image.png + image.txt)
+                key = (norm_dir, cstem.lower())
+                img_entry = image_by_dir_stem.get(key)
+                # Essai 2 : suffixes connus de sidecars (_prompt, _tags, _caption, _meta)
+                # ex: ComfyUI_00088_prompt.txt → image ComfyUI_00088.png
+                # Gère aussi le double underscore (ComfyUI_00088__prompt.txt → stem ComfyUI_00088_)
+                if img_entry is None:
+                    cstem_low = cstem.lower()
+                    for sidecar_suffix in ("_prompt", "_tags", "_caption", "_meta", "_desc", "_description"):
+                        if cstem_low.endswith(sidecar_suffix):
+                            base = cstem_low[: -len(sidecar_suffix)]
+                            cand = image_by_dir_stem.get((norm_dir, base))
+                            if cand is None and base.endswith("_"):
+                                # double-underscore: ComfyUI_00088__prompt → ComfyUI_00088
+                                cand = image_by_dir_stem.get((norm_dir, base.rstrip("_")))
+                            if cand is not None:
+                                img_entry = cand
+                                break
+                if img_entry:
+                    img_entry.companions.append(candidate_path)
+                    companion_paths.add(norm_candidate)
+
+            elif cext == ".ia":
+                # {stem}.ia — sidecar détection IA (JSON {is_ai, confidence, method, ...})
                 key = (norm_dir, cstem.lower())
                 img_entry = image_by_dir_stem.get(key)
                 if img_entry:
@@ -1045,11 +1069,11 @@ class DiskScanner:
         if not image_by_dir_stem:
             return  # Pas d'images → .txt/.json réguliers non traités, OK
 
-        # Scanner TOUTES les catégories pour .txt et .json réguliers
+        # Scanner TOUTES les catégories pour .txt, .json et .ia réguliers
         for cat, subcats in results.items():
             for subcat, entries in subcats.items():
                 for entry in list(entries):
-                    if entry.ext.lower() in (".txt", ".json"):
+                    if entry.ext.lower() in (".txt", ".json", ".ia"):
                         _check_and_attach(entry.path)
 
         for entry in list(uncategorized):
@@ -1062,9 +1086,14 @@ class DiskScanner:
             img_stem = os.path.splitext(img_entry.name)[0]
             for suffix in (
                 img_stem + ".txt",
+                img_stem + "_prompt.txt",
+                img_stem + "__prompt.txt",
+                img_stem + "_tags.txt",
+                img_stem + "_caption.txt",
                 img_stem + ".json",
                 img_stem + "_validation.json",
                 img_stem + "_aesthetic.json",
+                img_stem + ".ia",
             ):
                 candidate = os.path.join(real_dir, suffix)
                 if os.path.normcase(candidate) not in companion_paths and os.path.isfile(candidate):
@@ -1073,7 +1102,7 @@ class DiskScanner:
         if not companion_paths:
             return
 
-        # Retirer les compagnons .txt/.json réguliers des catégories (comparaison normalisée)
+        # Retirer les compagnons .txt / .json / .ia réguliers des catégories (comparaison normalisée)
         for cat in list(results.keys()):
             for subcat in list(results[cat].keys()):
                 results[cat][subcat] = [
@@ -5175,10 +5204,36 @@ def main_page():
                                 timeout=5000,
                             )
 
-                    # Lancer la passe de métadonnées
-                    await run_metadata_pass1(report.get("organized", []))
-                    report_ui.refresh()
-                    stepper.next()
+                    # Afficher le rapport AVANT la passe métadonnées : l'utilisateur
+                    # voit immédiatement le résultat de l'organisation. La passe
+                    # métadonnées (potentiellement longue) tourne ensuite en arrière-plan.
+                    try:
+                        report_ui.refresh()
+                    except Exception as e:
+                        state.add_log(f"⚠️ Refresh rapport impossible : {e}")
+                    try:
+                        stepper.next()
+                    except Exception as e:
+                        state.add_log(f"⚠️ Stepper.next() impossible : {e}")
+                        ui.notify(
+                            "Organisation terminée. Le rafraîchissement de l'UI a échoué — "
+                            "rechargez la page (F5) pour voir le rapport final.",
+                            type="warning",
+                            timeout=8000,
+                        )
+
+                    # Lancer la passe de métadonnées en tâche de fond (ne bloque plus l'UI)
+                    async def _metadata_bg():
+                        try:
+                            await run_metadata_pass1(report.get("organized", []))
+                            try:
+                                report_ui.refresh()  # mise à jour finale avec compteurs métadonnées
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            state.add_log(f"⚠️ Erreur passe métadonnées (arrière-plan) : {e}")
+
+                    background_tasks.create(_metadata_bg(), name="organizator.metadata_pass1")
 
                 async def run_metadata_pass1(organized: list):
                     """Passe 1 : extraction des métadonnées fichier."""
