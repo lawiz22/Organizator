@@ -1211,6 +1211,7 @@ class DatabaseCache:
                 (path, f"raw:{new_source or 'cache'}", prompt_text),
             )
             self.conn.commit()
+            self._write_prompt_sidecar(path)
             return
 
         c.execute(
@@ -1218,6 +1219,28 @@ class DatabaseCache:
             (path, new_source, prompt_text),
         )
         self.conn.commit()
+        self._write_prompt_sidecar(path)
+
+    def _write_prompt_sidecar(self, path):
+        """Ecrit {stem}_prompt.txt avec priorite detailed > raw."""
+        try:
+            p = Path(path)
+            best = ''
+            d = self.get_detailed_prompt(path)
+            if d and str(d.get('text', '') or '').strip():
+                best = str(d['text']).strip()
+            else:
+                c = self.conn.cursor()
+                c.execute("SELECT prompt FROM prompt_cache WHERE path=?", (path,))
+                row = c.fetchone()
+                if row and str(row[0] or '').strip():
+                    best = str(row[0]).strip()
+            if not best:
+                return
+            p.with_name(f"{p.stem}_prompt.txt").write_text(best, encoding='utf-8')
+        except Exception as e:
+            try: state.add_log(f"[PROMPT-SIDECAR] err {path}: {e}")
+            except Exception: pass
 
     def get_detailed_prompt(self, path):
         c = self.conn.cursor()
@@ -1244,6 +1267,7 @@ class DatabaseCache:
             (path, source, prompt_text),
         )
         self.conn.commit()
+        self._write_prompt_sidecar(path)
 
     # --- Détection IA ---
     def get_ai_detection(self, path):
@@ -1275,6 +1299,21 @@ class DatabaseCache:
             (path, 1 if is_ai else 0, float(confidence or 0.0), str(method or ''), det_json, float(time.time())),
         )
         self.conn.commit()
+        # Auto-ecriture du sidecar {stem}.ia
+        if is_ai is not None:
+            try:
+                payload = dict(detection) if isinstance(detection, dict) else {}
+                payload.setdefault('is_ai', bool(is_ai))
+                payload.setdefault('confidence', float(confidence or 0.0))
+                payload.setdefault('method', str(method or ''))
+                payload.setdefault('detected_at', datetime.datetime.now(datetime.timezone.utc).isoformat())
+                Path(path).with_suffix('.ia').write_text(
+                    json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+                    encoding='utf-8',
+                )
+            except Exception as e:
+                try: state.add_log(f"[IA-SIDECAR] err {path}: {e}")
+                except Exception: pass
 
     def delete_ai_detection(self, path):
         c = self.conn.cursor()
@@ -1336,6 +1375,47 @@ class DatabaseCache:
         c.execute("INSERT OR REPLACE INTO nsfw_cache (model, path, top_label, danger_score, details) VALUES (?, ?, ?, ?, ?)", 
                   (model_name, path, top_label, danger_score, json.dumps(details)))
         self.conn.commit()
+        # Auto-ecriture {stem}_validation.json (skip cas auto/pseudo)
+        try:
+            if top_label in ('error', 'no_person', 'portrait'):
+                return
+            det = details if isinstance(details, dict) else {}
+            real_keys = [k for k in det.keys() if not str(k).startswith('_')]
+            if not real_keys:
+                return
+            p = Path(path)
+            numeric_details = {}
+            for k, v in det.items():
+                if str(k).startswith('_') or v is None:
+                    continue
+                try: numeric_details[k] = float(v)
+                except (ValueError, TypeError):
+                    try: numeric_details[k] = int(v)
+                    except (ValueError, TypeError): numeric_details[k] = str(v)
+            try: expl_thr = float(getattr(state, 'nsfw_threshold', 0.5))
+            except Exception: expl_thr = 0.5
+            try: sens_thr = float(NSFW_SENSUAL_THRESHOLD)
+            except Exception: sens_thr = 0.3
+            payload = {
+                'schema': 'organizador.nsfw.validation.v1',
+                'validated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'source_file': str(p),
+                'file_name': p.name,
+                'result': {
+                    'tier': top_label,
+                    'danger': float(danger_score),
+                    'model': model_name,
+                    'raw_top_label': str(det.get('_raw_top_label', top_label)),
+                    'explicit_threshold': expl_thr,
+                    'sensual_threshold': sens_thr,
+                    'details': numeric_details,
+                },
+            }
+            with open(p.with_name(f"{p.stem}_validation.json"), 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+        except Exception as e:
+            try: state.add_log(f"[NSFW-SIDECAR] err {path}: {e}")
+            except Exception: pass
 
     def clear_nsfw_cache(self):
         """Vide complètement le cache NSFW pour forcer réanalyse."""
@@ -1365,6 +1445,26 @@ class DatabaseCache:
         c.execute("INSERT OR REPLACE INTO aes_cache (model, path, avg_score, max_score) VALUES (?, ?, ?, ?)", 
                   (model_name, path, avg_score, max_score))
         self.conn.commit()
+        # Auto-ecriture {stem}_aesthetic.json (skip si tout a zero, signal d'erreur)
+        try:
+            if not (float(avg_score) == 0.0 and float(max_score) == 0.0):
+                p = Path(path)
+                payload = {
+                    'schema': 'organizador.aesthetic.v1',
+                    'validated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    'source_file': str(p),
+                    'file_name': p.name,
+                    'result': {
+                        'avg_score': float(avg_score),
+                        'max_score': float(max_score),
+                        'model': model_name,
+                    },
+                }
+                with open(p.with_name(f"{p.stem}_aesthetic.json"), 'w', encoding='utf-8') as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+        except Exception as e:
+            try: state.add_log(f"[AES-SIDECAR] err {path}: {e}")
+            except Exception: pass
 
     def get_image_features(self, model_name, path):
         c = self.conn.cursor()
@@ -4236,6 +4336,92 @@ nsfw_engine = NsfwEngine(search_engine)
 face_engine = FaceEngine(search_engine)
 tag_engine = TagEngine(search_engine)
 
+# --- Helpers d'indexation de masse (IA + Prompt) ---
+def bulk_run_ia_detection(paths, ollama_model: str = "", use_ollama: bool = False, force: bool = False):
+    """Detection IA en lot. Skippe les fichiers deja en cache sauf si force=True.
+    save_ai_detection ecrit automatiquement le sidecar .ia."""
+    total = len(paths)
+    if not total:
+        return
+    state.add_log(f"[BULK-IA] {total} image(s) a traiter (ollama={'oui' if use_ollama else 'non'}, modele='{ollama_model or '-'}', force={force})")
+    done = 0
+    for fp in paths:
+        if not state.is_processing or search_engine.cancel_flag:
+            state.add_log("[BULK-IA] Annule par utilisateur")
+            break
+        done += 1
+        state.progress = done / total
+        state.status_text = f"IA {done}/{total} : {os.path.basename(fp)}"
+        try:
+            if not force:
+                cached = search_engine.db_cache.get_ai_detection(fp)
+                if cached and cached.get('is_ai') is not None:
+                    continue
+            res = run_ai_detection(fp, ollama_model=ollama_model, use_ollama_fallback=use_ollama)
+            if not isinstance(res, dict) or res.get('is_ai') is None:
+                continue
+            search_engine.db_cache.save_ai_detection(
+                fp,
+                bool(res.get('is_ai')),
+                float(res.get('confidence', 0.0)),
+                str(res.get('method', '')),
+                res,
+            )
+        except Exception as e:
+            state.add_log(f"[BULK-IA] err {fp}: {e}")
+    state.add_log(f"[BULK-IA] Termine ({done}/{total})")
+
+def bulk_run_prompt_generation(paths, provider: str = "local", model: str = "", mode: str = "both", force: bool = False):
+    """Genere prompts raw et/ou detailed en lot. save_prompt/save_detailed_prompt
+    ecrivent automatiquement le sidecar {stem}_prompt.txt."""
+    total = len(paths)
+    if not total:
+        return
+    state.add_log(f"[BULK-PROMPT] {total} image(s), provider={provider}, mode={mode}, modele='{model or '-'}', force={force}")
+    done = 0
+    src_tag = f"bulk_{provider}" + (f":{model}" if provider == 'ollama' and model else '')
+    for fp in paths:
+        if not state.is_processing or search_engine.cancel_flag:
+            state.add_log("[BULK-PROMPT] Annule par utilisateur")
+            break
+        done += 1
+        state.progress = done / total
+        state.status_text = f"Prompt {done}/{total} : {os.path.basename(fp)}"
+        try:
+            payload = _collect_llm_payload_from_cache(fp)
+            base_text = str(payload.get('prompt') or '').strip()
+            tags_dict = payload.get('tags') or {}
+            ai_payload = payload.get('ai') or None
+
+            def _gen(sub_mode: str) -> str:
+                if provider == 'ollama' and model:
+                    if sub_mode == 'detailed':
+                        return _ollama_detailed_prompt(model, base_text, tags_dict, ai_payload, fp)
+                    return _ollama_raw_prompt(model, base_text, tags_dict, fp)
+                # local fallback
+                if sub_mode == 'detailed':
+                    return TagEngine._build_detailed_prompt_fallback(base_text, tags_dict, ai_payload, fp)
+                # raw local = base_text si dispo, sinon liste de tags
+                if base_text:
+                    return base_text
+                if tags_dict:
+                    return ", ".join(sorted(tags_dict.keys(), key=lambda k: tags_dict[k], reverse=True))
+                return ''
+
+            if mode in ('raw', 'both'):
+                if force or not (search_engine.db_cache.get_prompt(fp) or {}).get('text'):
+                    raw_out = _gen('raw')
+                    if raw_out:
+                        search_engine.db_cache.save_prompt(fp, raw_out, source=src_tag)
+            if mode in ('detailed', 'both'):
+                if force or not (search_engine.db_cache.get_detailed_prompt(fp) or {}).get('text'):
+                    det_out = _gen('detailed')
+                    if det_out:
+                        search_engine.db_cache.save_detailed_prompt(fp, det_out, source=src_tag)
+        except Exception as e:
+            state.add_log(f"[BULK-PROMPT] err {fp}: {e}")
+    state.add_log(f"[BULK-PROMPT] Termine ({done}/{total})")
+
 def open_file_native(filepath):
     try: os.startfile(filepath) if os.name == 'nt' else subprocess.call(('xdg-open', filepath))
     except Exception as e: ui.notify(f"Erreur d'ouverture : {e}", type='negative')
@@ -4328,10 +4514,25 @@ def clear_prompt_folder_cache(folder_path):
     search_engine.db_cache.conn.commit()
     return prompt_deleted, detailed_deleted
 
+# Liste d'elements ui.log additionnels (panneaux inline par onglet)
+_extra_log_elements = []
+
+def register_log_panel(elem):
+    if elem not in _extra_log_elements:
+        _extra_log_elements.append(elem)
+
 def update_ui_logs():
-    if 'ui_log_element' in globals() and state.logs:
-        for msg in state.logs: ui_log_element.push(msg)
-        state.logs.clear()
+    if not state.logs:
+        return
+    has_main = 'ui_log_element' in globals()
+    for msg in state.logs:
+        if has_main:
+            try: ui_log_element.push(msg)
+            except Exception: pass
+        for elem in _extra_log_elements:
+            try: elem.push(msg)
+            except Exception: pass
+    state.logs.clear()
 
 def clear_logs():
     state.full_log_history.clear()
@@ -5600,7 +5801,7 @@ def index_page():
                         is_video = path.lower().endswith(SUPPORTED_VIDEOS)
                         aes_info = aesthetic_explain(avg_score, max_score, is_video) if state.aes_scan_mode == 'score' else None
                         nsfw_tier = _read_nsfw_tier(path)
-                        card_bdr = f'border-2 {_NSFW_CARD_BORDER[nsfw_tier]}' if nsfw_tier else 'border border-gray-700'
+                        card_bdr = f'border-2 {_NSFW_CARD_BORDER.get(nsfw_tier, "border-gray-600")}' if nsfw_tier else 'border border-gray-700'
 
                         if compact:
                             with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-yellow-500 transition-colors p-0 overflow-hidden relative'):
@@ -6196,7 +6397,7 @@ def index_page():
                         top_tags = sorted(tags_dict.items(), key=lambda x: x[1], reverse=True)[:3]
                         top_tags_str = ", ".join([f"{k}" for k, v in top_tags])
                         nsfw_tier = _read_nsfw_tier(path)
-                        card_bdr = f'border-2 {_NSFW_CARD_BORDER[nsfw_tier]}' if nsfw_tier else 'border border-gray-700'
+                        card_bdr = f'border-2 {_NSFW_CARD_BORDER.get(nsfw_tier, "border-gray-600")}' if nsfw_tier else 'border border-gray-700'
 
                         if compact:
                             with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-pink-500 transition-colors p-0 overflow-hidden relative'):
@@ -6362,7 +6563,7 @@ def index_page():
                         global_index = all_paths.index(path)
                         preview = (prompt_text or detailed_prompt_text or '').strip()
                         nsfw_tier = _read_nsfw_tier(path)
-                        card_bdr = f'border-2 {_NSFW_CARD_BORDER[nsfw_tier]}' if nsfw_tier else 'border border-gray-700'
+                        card_bdr = f'border-2 {_NSFW_CARD_BORDER.get(nsfw_tier, "border-gray-600")}' if nsfw_tier else 'border border-gray-700'
 
                         if compact:
                             with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-cyan-500 transition-colors p-0 overflow-hidden relative'):
@@ -6524,7 +6725,7 @@ def index_page():
                         global_index = all_paths.index(path)
                         badge_text, badge_cls = _IA_BADGES.get(is_ai_v, _IA_BADGES[None])
                         nsfw_tier = _read_nsfw_tier(path)
-                        card_bdr = f'border-2 {_NSFW_CARD_BORDER[nsfw_tier]}' if nsfw_tier else 'border border-gray-700'
+                        card_bdr = f'border-2 {_NSFW_CARD_BORDER.get(nsfw_tier, "border-gray-600")}' if nsfw_tier else 'border border-gray-700'
 
                         if compact:
                             with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-cyan-500 transition-colors p-0 overflow-hidden relative'):
@@ -9416,6 +9617,32 @@ def index_page():
 
                 chk_cache_face = ui.checkbox('Recherche par visage (InsightFace)', value=cfg.get('chk_cache_face', False)).classes('text-md font-bold text-teal-300')
 
+                chk_cache_ia = ui.checkbox('Détecteur IA (sidecar .ia)', value=cfg.get('chk_cache_ia', False)).classes('text-md font-bold text-purple-300')
+                with ui.column().classes('w-full pl-6 pr-6 gap-1').bind_visibility_from(chk_cache_ia, 'value'):
+                    chk_cache_ia_use_ollama = ui.checkbox('Utiliser Ollama en secours (sinon EXIF/PNG metadata seul)', value=cfg.get('chk_cache_ia_use_ollama', False)).classes('text-xs')
+                    with ui.row().classes('w-full items-center gap-2'):
+                        _ollama_cached = cfg.get('_ollama_models_cached') or []
+                        _ia_model_val = cfg.get('ia_ollama_model', '') or ''
+                        _ia_options = _ollama_cached if _ollama_cached else ([_ia_model_val] if _ia_model_val else [])
+                        cache_ia_ollama_model = ui.select(_ia_options, value=_ia_model_val if _ia_model_val in _ia_options else None, label='Modele Ollama (IA)', with_input=True).classes('flex-grow')
+                        def _refresh_ollama_cache_ia():
+                            models = _ollama_list_models()
+                            save_config({'_ollama_models_cached': models})
+                            cache_ia_ollama_model.set_options(models, value=cache_ia_ollama_model.value if cache_ia_ollama_model.value in models else None)
+                            cache_prompt_ollama_model.set_options(models, value=cache_prompt_ollama_model.value if cache_prompt_ollama_model.value in models else None)
+                            ui.notify(f'{len(models)} modele(s) Ollama detecte(s)', type='positive')
+                        ui.button(icon='refresh', on_click=_refresh_ollama_cache_ia).props('flat round dense').tooltip('Recharger la liste Ollama')
+
+                chk_cache_prompt = ui.checkbox('Génération prompt (sidecar _prompt.txt)', value=cfg.get('chk_cache_prompt', False)).classes('text-md font-bold text-indigo-300')
+                with ui.column().classes('w-full pl-6 pr-6 gap-1').bind_visibility_from(chk_cache_prompt, 'value'):
+                    with ui.row().classes('w-full items-center gap-2'):
+                        cache_prompt_provider = ui.select(['local', 'ollama'], value=cfg.get('cache_prompt_provider', 'local'), label='Provider').classes('w-32')
+                        cache_prompt_mode = ui.select(['raw', 'detailed', 'both'], value=cfg.get('cache_prompt_mode', 'both'), label='Mode').classes('w-32')
+                        _pp_model_val = cfg.get('tags_ollama_model', '') or ''
+                        _pp_options = _ollama_cached if _ollama_cached else ([_pp_model_val] if _pp_model_val else [])
+                        cache_prompt_ollama_model = ui.select(_pp_options, value=_pp_model_val if _pp_model_val in _pp_options else None, label='Modele Ollama', with_input=True).classes('flex-grow')
+                    cache_prompt_force = ui.checkbox('Forcer regeneration (ignorer cache)', value=cfg.get('cache_prompt_force', False)).classes('text-xs')
+
                 with ui.expansion('Parametres avances unifies', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-4'):
                     with ui.row().classes('w-full gap-4 px-4 pt-4'):
                         cache_batch_size = ui.number('Taille lot', value=cfg.get('batch_size', 16), format='%.0f').classes('flex-1')
@@ -9437,6 +9664,14 @@ def index_page():
                         'chk_cache_search': chk_cache_search.value, 'chk_cache_aes': chk_cache_aes.value, 
                         'chk_cache_nsfw': chk_cache_nsfw.value, 'chk_cache_face': chk_cache_face.value,
                         'chk_cache_tags': chk_cache_tags.value,
+                        'chk_cache_ia': chk_cache_ia.value,
+                        'chk_cache_ia_use_ollama': chk_cache_ia_use_ollama.value,
+                        'ia_ollama_model': cache_ia_ollama_model.value,
+                        'chk_cache_prompt': chk_cache_prompt.value,
+                        'cache_prompt_provider': cache_prompt_provider.value,
+                        'cache_prompt_mode': cache_prompt_mode.value,
+                        'tags_ollama_model': cache_prompt_ollama_model.value,
+                        'cache_prompt_force': cache_prompt_force.value,
                         'search_quant_mode': cache_search_quant.value, 'aes_quant_mode': cache_aes_quant.value,
                         'nsfw_quant_mode': cache_nsfw_quant.value,
                         'use_ram_compression': use_ram_compression.value, 'cache_chunk_size': cache_chunk_size.value
@@ -9551,6 +9786,41 @@ def index_page():
                                     tag_engine.unload()
                                     face_engine.build_cache(cache_dir.value, tuple(exts_media), override_files=chunk)
 
+                                # Etape 6 : Detection IA (images uniquement, sidecar .ia auto)
+                                if chk_cache_ia.value and not search_engine.cancel_flag:
+                                    if len(chunks) > 1: state.add_log(f"-> Bloc {idx+1}: Detection IA")
+                                    else: state.add_log(f"-> Etape 6: Detection IA")
+                                    search_engine._unload_embedding_model()
+                                    aesthetic_engine.unload()
+                                    nsfw_engine.unload()
+                                    tag_engine.unload()
+                                    face_engine.unload()
+                                    images_only = [p for p in chunk if p.lower().endswith(SUPPORTED_IMAGES)]
+                                    bulk_run_ia_detection(
+                                        images_only,
+                                        ollama_model=str(cache_ia_ollama_model.value or '').strip(),
+                                        use_ollama=bool(chk_cache_ia_use_ollama.value),
+                                        force=False,
+                                    )
+
+                                # Etape 7 : Generation prompt (sidecar _prompt.txt auto)
+                                if chk_cache_prompt.value and not search_engine.cancel_flag:
+                                    if len(chunks) > 1: state.add_log(f"-> Bloc {idx+1}: Generation prompt")
+                                    else: state.add_log(f"-> Etape 7: Generation prompt")
+                                    search_engine._unload_embedding_model()
+                                    aesthetic_engine.unload()
+                                    nsfw_engine.unload()
+                                    tag_engine.unload()
+                                    face_engine.unload()
+                                    images_only = [p for p in chunk if p.lower().endswith(SUPPORTED_IMAGES)]
+                                    bulk_run_prompt_generation(
+                                        images_only,
+                                        provider=str(cache_prompt_provider.value or 'local').strip().lower(),
+                                        model=str(cache_prompt_ollama_model.value or '').strip(),
+                                        mode=str(cache_prompt_mode.value or 'both').strip().lower(),
+                                        force=bool(cache_prompt_force.value),
+                                    )
+
                             state.add_log("🎉 Indexation complete terminee avec succes !")
                         except Exception as e: state.add_log(f"❌ Erreur d'indexation : {e}")
                         finally:
@@ -9565,6 +9835,41 @@ def index_page():
                     btn_cache.enable()
 
                 btn_cache = ui.button('🚀 Lancer indexation complete', on_click=run_cache_action).classes('w-full bg-blue-600 hover:bg-blue-500 font-bold text-lg mt-4')
+
+                # --- Panneau de journaux precis inline ---
+                with ui.card().classes('w-full mt-4 bg-gray-900 border border-gray-700 p-3'):
+                    with ui.row().classes('w-full items-center justify-between mb-2'):
+                        ui.label('📜 Journaux precis (en direct)').classes('text-sm font-bold text-blue-300')
+                        with ui.row().classes('gap-1 items-center'):
+                            cache_log_filter = ui.input(placeholder='Filtre (substring)').props('dense outlined dark').classes('w-48')
+                            def _copy_cache_log():
+                                ui.clipboard.write('\n'.join(state.full_log_history))
+                                ui.notify('Journaux copies !', type='positive')
+                            def _clear_cache_log():
+                                cache_log_element.clear()
+                                ui.notify('Panneau efface (historique global conserve)', type='info')
+                            ui.button(icon='content_copy', on_click=_copy_cache_log).props('flat round dense text-color=gray').tooltip('Copier tout l\'historique')
+                            ui.button(icon='delete_sweep', on_click=_clear_cache_log).props('flat round dense text-color=red').tooltip('Vider le panneau')
+                    cache_log_element = ui.log(max_lines=2000).classes('w-full h-72 bg-black text-green-400 font-mono text-xs p-2 rounded overflow-y-auto whitespace-pre-wrap break-words')
+
+                    class _FilteredLog:
+                        def __init__(self, inner, filter_input):
+                            self.inner = inner
+                            self.filter_input = filter_input
+                        def push(self, msg):
+                            f = (self.filter_input.value or '').strip().lower()
+                            if f and f not in msg.lower():
+                                return
+                            try: self.inner.push(msg)
+                            except Exception: pass
+                        def clear(self):
+                            try: self.inner.clear()
+                            except Exception: pass
+
+                    register_log_panel(_FilteredLog(cache_log_element, cache_log_filter))
+                    for _msg in state.full_log_history[-500:]:
+                        try: cache_log_element.push(_msg)
+                        except Exception: pass
 
     with ui.footer().classes('bg-gray-900 border-t border-gray-800 px-4 py-0 flex flex-row flex-nowrap items-center justify-between z-40 h-8 shadow-lg'):
         ui.label().bind_text_from(state, 'status_text').classes('text-blue-400 font-mono text-xs truncate max-w-[30%] shrink-0')

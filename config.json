@@ -87,7 +87,7 @@
     "chk_prefix_nsfw": false,
     "nsfw_mode": "Strict",
     "_nsfw_cache_version": "v14",
-    "cache_dir": "F:/100GOPRO/input",
+    "cache_dir": "F:/100GOPRO/output",
     "chk_cache_img": true,
     "chk_cache_vid": false,
     "chk_cache_txt": false,
@@ -119,5 +119,11 @@
     "ia_ollama_model": "gemma3:4b",
     "ia_use_ollama": true,
     "ia_write_sidecar_auto": true,
-    "tags_prompt_wizard_mode": "silent"
+    "tags_prompt_wizard_mode": "silent",
+    "chk_cache_ia": true,
+    "chk_cache_ia_use_ollama": false,
+    "chk_cache_prompt": true,
+    "cache_prompt_provider": "local",
+    "cache_prompt_mode": "both",
+    "cache_prompt_force": false
 }
