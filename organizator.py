@@ -149,6 +149,16 @@ DEFAULT_CATEGORIES = {
         "icon": "folder_special",
         "color": "orange",
         "extensions": {}  # Détection par signature de projet
+    },
+    # Categorie dediee aux fichiers "marqueurs de projet" rencontres HORS
+    # d'un dossier promu projet (ex: un .psd isole au milieu d'un album
+    # musical, lorsque le garde-fou anti-absorption empeche la promotion).
+    # Ces fichiers sont conserves a part, jamais melanges avec les images /
+    # videos courantes, pour faciliter un tri manuel ulterieur.
+    "ORPHELINS": {
+        "icon": "help_outline",
+        "color": "amber",
+        "extensions": {}  # Aucune detection automatique par extension
     }
 }
 
@@ -169,6 +179,17 @@ DEFAULT_PROJECT_SIGNATURES = {
 }
 
 PROJECT_SIGNATURES = dict(DEFAULT_PROJECT_SIGNATURES)
+
+# Reclassement des fichiers marqueurs lorsqu'ils sont rencontres HORS d'un
+# dossier promu projet (ex: un .psd isole au milieu d'un album musical, suite
+# au garde-fou anti-absorption). Le fichier est alors traite comme une image
+# ou video standard et deplace via les regles habituelles.
+PROJECT_MARKER_FILE_FALLBACK = {
+    ".psd": ("ORPHELINS", "Photoshop"),
+    ".psb": ("ORPHELINS", "Photoshop"),
+    ".aep": ("ORPHELINS", "After-Effects"),
+    ".aet": ("ORPHELINS", "After-Effects"),
+}
 
 AUDIO_EXTENSIONS = {
     ".mp3", ".m4a", ".aac", ".ogg", ".wma", ".opus",
@@ -236,6 +257,11 @@ class OrganizerState:
         self.video_skip_date_hierarchy: bool = False
         self.video_no_date_folder_name: str = "DiversVideo"
 
+        # Images — options de structure et destination dédiée
+        self.image_skip_date_hierarchy: bool = False   # si True : pas de YYYY-MM-DD
+        self.image_no_date_folder_name: str = "ImagesDivers"
+        self.image_destination: str = ""               # racine alternative pour images (optionnel)
+
         # Reclassification manuelle des images IA ↔ Vraies Photos
         self.image_reclassify_overrides: dict = {}  # {path: "IA-Images" | "Images"}
 
@@ -297,6 +323,9 @@ class OrganizerState:
         self.delete_empty_sources_after_move = False
         self.video_skip_date_hierarchy = False
         self.video_no_date_folder_name = "DiversVideo"
+        self.image_skip_date_hierarchy = False
+        self.image_no_date_folder_name = "ImagesDivers"
+        self.image_destination = ""
 
 
 state = OrganizerState()
@@ -839,6 +868,15 @@ class DiskScanner:
                     continue
 
                 _, subcat = project_ext_lookup[marker_ext]
+
+                # Garde-fou : un dossier contenant de la musique ne doit PAS
+                # etre absorbe par un projet non-audio (sinon les .mp3/.flac
+                # disparaissent du scan). Le marqueur isole (.psd, .aep) est
+                # alors traite comme un fichier image/video standard.
+                if subcat not in AUDIO_PROJECT_CATEGORIES:
+                    if any(e in AUDIO_EXTENSIONS for e in root_extensions):
+                        continue
+
                 project_root_lookup[norm_root] = (root, subcat)
                 project_detection_evidence[root] = {
                     "subcategory": subcat,
@@ -891,11 +929,25 @@ class DiskScanner:
 
                     elif ext in project_ext_lookup:
                         cat, subcat = project_ext_lookup[ext]
-                        # Racine du projet = dossier parent du fichier signature
-                        proj_root = root
-                        # Ajouter aussi comme entrée pour les stats
-                        entry = ScanEntry(fpath, fname, ext, fsize, fmtime, cat, subcat)
-                        results[cat][subcat].append(entry)
+                        if norm_root in project_root_lookup:
+                            # Vrai marqueur projet : le dossier a ete promu projet.
+                            # On garde une entree pour les stats ; organize() copytree
+                            # le projet entier separement.
+                            entry = ScanEntry(fpath, fname, ext, fsize, fmtime, cat, subcat)
+                            results[cat][subcat].append(entry)
+                        else:
+                            # Marqueur isole (ex: .psd dans un dossier de musique,
+                            # garde-fou anti-absorption actif). On reclasse en image
+                            # ou video standard pour qu'il soit deplace normalement.
+                            fallback = PROJECT_MARKER_FILE_FALLBACK.get(ext)
+                            if fallback:
+                                fb_cat, fb_sub = fallback
+                                entry = ScanEntry(fpath, fname, ext, fsize, fmtime, fb_cat, fb_sub)
+                                results[fb_cat][fb_sub].append(entry)
+                            else:
+                                # Pas de fallback connu (.uproject, .als hors AUDIO_PROJECT...)
+                                entry = ScanEntry(fpath, fname, ext, fsize, fmtime, "?", ext or "(sans extension)")
+                                uncategorized.append(entry)
 
                     elif ext in ext_lookup:
                         if in_project_root or (
@@ -907,10 +959,9 @@ class DiskScanner:
                             processed += 1
                             continue
                         cat, subcat = ext_lookup[ext]
-                        # Détection automatique images IA
-                        if cat == "PHOTO-VIDEO" and subcat == "Images" and ext in DiskScanner.AI_DETECTABLE_EXTS:
-                            if DiskScanner.detect_ai_image_metadata(fpath):
-                                subcat = "IA-Images"
+                        # Pas de guess IA ici : la sous-cat "IA-Images" est promue
+                        # ulterieurement par _resolve_companions a partir du sidecar .ia
+                        # (champ is_ai=true). Aucun parsing PNG/EXIF.
                         entry = ScanEntry(fpath, fname, ext, fsize, fmtime, cat, subcat)
                         results[cat][subcat].append(entry)
 
@@ -956,11 +1007,15 @@ class DiskScanner:
             return (entry.ext.lower() == ".json" and
                     os.path.splitext(entry.name)[0].lower().endswith("_aesthetic"))
 
+        def _is_tags_json(entry) -> bool:
+            return (entry.ext.lower() == ".json" and
+                    os.path.splitext(entry.name)[0].lower().endswith("_tags"))
+
         for cat in list(results.keys()):
             for subcat in list(results[cat].keys()):
                 kept, removed = [], []
                 for e in results[cat][subcat]:
-                    if _is_validation_json(e) or _is_aesthetic_json(e):
+                    if _is_validation_json(e) or _is_aesthetic_json(e) or _is_tags_json(e):
                         removed.append(e)
                     else:
                         kept.append(e)
@@ -974,7 +1029,7 @@ class DiskScanner:
                 del results[cat]
 
         for i in range(len(uncategorized) - 1, -1, -1):
-            if _is_validation_json(uncategorized[i]) or _is_aesthetic_json(uncategorized[i]):
+            if _is_validation_json(uncategorized[i]) or _is_aesthetic_json(uncategorized[i]) or _is_tags_json(uncategorized[i]):
                 validation_entries.append(uncategorized[i])
                 del uncategorized[i]
 
@@ -1020,12 +1075,21 @@ class DiskScanner:
                     companion_paths.add(norm_candidate)
 
             elif cext == ".ia":
-                # {stem}.ia — sidecar détection IA (JSON {is_ai, confidence, method, ...})
+                # {stem}.ia — sidecar detection IA (JSON {is_ai, confidence, method, ...})
                 key = (norm_dir, cstem.lower())
                 img_entry = image_by_dir_stem.get(key)
                 if img_entry:
                     img_entry.companions.append(candidate_path)
                     companion_paths.add(norm_candidate)
+                    # Promotion Images -> IA-Images UNIQUEMENT via le sidecar .ia
+                    try:
+                        with open(candidate_path, "r", encoding="utf-8") as f:
+                            ia_data = _json.load(f)
+                        if isinstance(ia_data, dict) and bool(ia_data.get("is_ai")):
+                            if img_entry.subcategory == "Images":
+                                img_entry.subcategory = "IA-Images"
+                    except Exception:
+                        pass
 
             elif cext == ".json":
                 cstem_lower = cstem.lower()
@@ -1049,6 +1113,14 @@ class DiskScanner:
                 elif cstem_lower.endswith("_aesthetic"):
                     # {stem}_aesthetic.json — fichier compagnon de score esthétique
                     base_stem = cstem_lower[:-len("_aesthetic")]
+                    key = (norm_dir, base_stem)
+                    img_entry = image_by_dir_stem.get(key)
+                    if img_entry:
+                        img_entry.companions.append(candidate_path)
+                        companion_paths.add(norm_candidate)
+                elif cstem_lower.endswith("_tags"):
+                    # {stem}_tags.json — sidecar tags (auto-ecrit par MediaMind AI)
+                    base_stem = cstem_lower[:-len("_tags")]
                     key = (norm_dir, base_stem)
                     img_entry = image_by_dir_stem.get(key)
                     if img_entry:
@@ -1093,6 +1165,7 @@ class DiskScanner:
                 img_stem + ".json",
                 img_stem + "_validation.json",
                 img_stem + "_aesthetic.json",
+                img_stem + "_tags.json",
                 img_stem + ".ia",
             ):
                 candidate = os.path.join(real_dir, suffix)
@@ -1116,6 +1189,17 @@ class DiskScanner:
         for i in range(len(uncategorized) - 1, -1, -1):
             if os.path.normcase(uncategorized[i].path) in companion_paths:
                 del uncategorized[i]
+
+        # Reclasser les images promues vers IA-Images via le sidecar .ia.
+        # entry.subcategory peut avoir ete modifiee plus haut ; on aligne les buckets.
+        pv = results.get("PHOTO-VIDEO")
+        if pv:
+            promoted = [e for e in pv.get("Images", []) if e.subcategory == "IA-Images"]
+            if promoted:
+                pv["Images"] = [e for e in pv["Images"] if e.subcategory != "IA-Images"]
+                pv.setdefault("IA-Images", []).extend(promoted)
+                if not pv["Images"]:
+                    del pv["Images"]
 
 
     @staticmethod
@@ -1410,6 +1494,9 @@ class FileOrganizer:
         video_overrides: dict = None,
         video_skip_date_hierarchy: bool = False,
         video_no_date_folder_name: str = "DiversVideo",
+        image_skip_date_hierarchy: bool = False,
+        image_no_date_folder_name: str = "ImagesDivers",
+        image_destination: str = "",
     ) -> str:
         """Calcule le chemin de destination pour un fichier.
         
@@ -1478,7 +1565,12 @@ class FileOrganizer:
 
                 return os.path.join(base_dest, "PHOTO-VIDEO", subcat, *folder_parts, date_folder, final_name)
 
-            return os.path.join(base_dest, "PHOTO-VIDEO", subcat, date_folder, final_name)
+            # Images / IA-Images : destination racine alternative + skip date optionnels
+            img_base = (image_destination or "").strip() or base_dest
+            if image_skip_date_hierarchy:
+                folder_name = self._sanitize(image_no_date_folder_name or "ImagesDivers")
+                return os.path.join(img_base, "PHOTO-VIDEO", subcat, folder_name, final_name)
+            return os.path.join(img_base, "PHOTO-VIDEO", subcat, date_folder, final_name)
 
         elif cat == "DOCUMENTS":
             return os.path.join(base_dest, "DOCUMENTS", subcat, entry.name)
@@ -1557,6 +1649,9 @@ class FileOrganizer:
         video_overrides: dict = None,
         video_skip_date_hierarchy: bool = False,
         video_no_date_folder_name: str = "DiversVideo",
+        image_skip_date_hierarchy: bool = False,
+        image_no_date_folder_name: str = "ImagesDivers",
+        image_destination: str = "",
     ) -> dict:
         """
         Exécute l'organisation. Retourne un rapport.
@@ -1593,6 +1688,9 @@ class FileOrganizer:
                         video_overrides,
                         video_skip_date_hierarchy,
                         video_no_date_folder_name,
+                        image_skip_date_hierarchy,
+                        image_no_date_folder_name,
+                        image_destination,
                     )
                     # Routage NSFW vers destination alternative
                     is_nsfw = entry.nsfw_status in ("SENSUEL", "EXPLICIT")
@@ -1600,7 +1698,11 @@ class FileOrganizer:
                         if state.nsfw_destination:
                             # Remplacer la base de destination par nsfw_destination
                             # en préservant toute la structure (catégorie/sous-cat/date/fichier)
-                            base_dest = self._base_destination(entry.path)
+                            # Pour les images, la base est image_destination si renseigne.
+                            if entry.category == "PHOTO-VIDEO" and entry.subcategory in ("Images", "IA-Images") and image_destination:
+                                base_dest = image_destination
+                            else:
+                                base_dest = self._base_destination(entry.path)
                             try:
                                 rel = os.path.relpath(dest, base_dest)
                             except ValueError:
@@ -2516,19 +2618,68 @@ def get_video_thumbnail_data_url(path: str, mtime: float, size: int) -> Optional
     return None
 
 
+_TK_PICKER_SCRIPT = (
+    "import sys, tkinter as tk\n"
+    "from tkinter import filedialog\n"
+    "root = tk.Tk()\n"
+    "root.attributes('-topmost', True)\n"
+    "root.withdraw()\n"
+    "try:\n"
+    "    folder = filedialog.askdirectory()\n"
+    "finally:\n"
+    "    try: root.destroy()\n"
+    "    except Exception: pass\n"
+    "sys.stdout.write(folder or '')\n"
+    "sys.stdout.flush()\n"
+)
+
+
 def pick_folder_native() -> str:
-    import tkinter as tk
-    from tkinter import filedialog
-    root = tk.Tk()
-    root.attributes("-topmost", True)
-    root.withdraw()
-    folder = filedialog.askdirectory()
-    root.destroy()
-    return folder
+    """Sélecteur de dossier synchrone — fallback si l'event-loop n'est pas dispo.
+
+    NE PAS utiliser dans un handler NiceGUI : utiliser `select_folder_async()`
+    qui passe par `asyncio.create_subprocess_exec` (totalement non-bloquant).
+    """
+    import subprocess
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _TK_PICKER_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        return (proc.stdout or "").strip()
+    except Exception:
+        return ""
 
 
 async def select_folder_async() -> str:
-    return await run.io_bound(pick_folder_native)
+    """Ouvre un dialogue tkinter dans un sous-processus, en mode 100% async.
+
+    `tkinter` créé sur un thread worker NiceGUI/uvicorn fige Windows et tue
+    le websocket ('connection lost'). On délègue à un Python séparé piloté
+    par asyncio : aucun blocage de l'event-loop principal.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", _TK_PICKER_SCRIPT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return ""
+        return (stdout or b"").decode("utf-8", errors="ignore").strip()
+    except Exception:
+        # Dernier recours : version sync via thread (peut figer sur Windows).
+        return await run.io_bound(pick_folder_native)
 
 
 def build_video_preview_url(path: str) -> str:
@@ -2882,34 +3033,81 @@ def main_page():
             "video_selection_ui": None,
             "ia_images_ui": None,
             "real_images_ui": None,
+            "music_tab": None,
         }
+
+        def _safe_refresh(label: str, fn):
+            """Appelle fn() en absorbant 'parent slot deleted' (slot mort).
+
+            Cas typique : l'utilisateur est revenu en arrière dans le stepper,
+            un nouveau scan a remplacé les conteneurs, et l'ancienne ref
+            @ui.refreshable pointe vers un slot supprimé. Partagé par toutes
+            les transitions go_from_stepN.
+            """
+            if not fn:
+                return
+            try:
+                fn()
+            except RuntimeError as _re:
+                msg = str(_re)
+                if 'parent slot' in msg.lower() or 'deleted' in msg.lower():
+                    print(f"[stepper] {label}: slot mort ignoré ({msg})", flush=True)
+                    for _k, _v in list(step_refresh_refs.items()):
+                        if _v is fn:
+                            step_refresh_refs[_k] = None
+                    return
+                raise
 
         async def go_from_step2():
             """Lazy-refresh étape 3 au moment de la navigation depuis l'étape 2."""
+            import traceback as _tb, time as _time
             state.is_loading = True
             state.status_text = "⏳ Chargement sélection..."
-            await asyncio.sleep(0)
-            selection_ui.refresh()
-            await asyncio.sleep(0)
-            if step_refresh_refs["video_selection_ui"]:
-                step_refresh_refs["video_selection_ui"]()
-            if step_refresh_refs["ia_images_ui"]:
-                step_refresh_refs["ia_images_ui"]()
-            if step_refresh_refs["real_images_ui"]:
-                step_refresh_refs["real_images_ui"]()
-            state.is_loading = False
-            state.status_text = "✅ Prêt"
-            stepper.next()
+            print("[go_from_step2] start", flush=True)
+            t0 = _time.monotonic()
+
+            try:
+                await asyncio.sleep(0.05)
+                print(f"[go_from_step2] selection_ui.refresh() ... t={_time.monotonic()-t0:.2f}s", flush=True)
+                _safe_refresh("selection_ui", selection_ui.refresh)
+                await asyncio.sleep(0.05)
+                if step_refresh_refs["video_selection_ui"]:
+                    print(f"[go_from_step2] video_selection_ui ... t={_time.monotonic()-t0:.2f}s", flush=True)
+                    _safe_refresh("video_selection_ui", step_refresh_refs["video_selection_ui"])
+                    await asyncio.sleep(0.05)
+                if step_refresh_refs["ia_images_ui"]:
+                    print(f"[go_from_step2] ia_images_ui ... t={_time.monotonic()-t0:.2f}s", flush=True)
+                    _safe_refresh("ia_images_ui", step_refresh_refs["ia_images_ui"])
+                    await asyncio.sleep(0.05)
+                if step_refresh_refs["real_images_ui"]:
+                    print(f"[go_from_step2] real_images_ui ... t={_time.monotonic()-t0:.2f}s", flush=True)
+                    _safe_refresh("real_images_ui", step_refresh_refs["real_images_ui"])
+                    await asyncio.sleep(0.05)
+                if step_refresh_refs["music_tab"]:
+                    print(f"[go_from_step2] music_tab ... t={_time.monotonic()-t0:.2f}s", flush=True)
+                    _safe_refresh("music_tab", step_refresh_refs["music_tab"])
+                    await asyncio.sleep(0.05)
+                state.is_loading = False
+                state.status_text = "✅ Prêt"
+                print(f"[go_from_step2] DONE t={_time.monotonic()-t0:.2f}s", flush=True)
+                stepper.next()
+            except Exception as e:
+                state.is_loading = False
+                state.status_text = f"❌ Erreur: {e}"
+                print("[go_from_step2] ERROR after %.2fs:" % (_time.monotonic()-t0), flush=True)
+                _tb.print_exc()
+                try:
+                    ui.notify(f"Erreur transition étape 3: {e}", type="negative", multi_line=True, timeout=10000)
+                except Exception:
+                    pass
 
         async def go_from_step3():
             if state.uncategorized:
                 state.is_loading = True
                 state.status_text = "⏳ Chargement fichiers non catégorisés..."
-                await asyncio.sleep(0)
-                if step_refresh_refs["uncategorized_table"]:
-                    step_refresh_refs["uncategorized_table"]()
-                if step_refresh_refs["uncategorized_label"]:
-                    step_refresh_refs["uncategorized_label"]()
+                await asyncio.sleep(0.05)
+                _safe_refresh("uncategorized_table", step_refresh_refs["uncategorized_table"])
+                _safe_refresh("uncategorized_label", step_refresh_refs["uncategorized_label"])
                 state.is_loading = False
                 state.status_text = "✅ Prêt"
                 stepper.set_value("Étape 4")
@@ -2917,18 +3115,16 @@ def main_page():
             if state.installer_files:
                 state.is_loading = True
                 state.status_text = "⏳ Chargement installeurs..."
-                await asyncio.sleep(0)
-                if step_refresh_refs["installers_ui"]:
-                    step_refresh_refs["installers_ui"]()
+                await asyncio.sleep(0.05)
+                _safe_refresh("installers_ui", step_refresh_refs["installers_ui"])
                 state.is_loading = False
                 state.status_text = "✅ Prêt"
                 stepper.set_value("Étape 5")
                 return
             state.is_loading = True
             state.status_text = "⏳ Chargement résumé..."
-            await asyncio.sleep(0)
-            if step_refresh_refs["summary_ui"]:
-                step_refresh_refs["summary_ui"]()
+            await asyncio.sleep(0.05)
+            _safe_refresh("summary_ui", step_refresh_refs["summary_ui"])
             state.is_loading = False
             state.status_text = "✅ Prêt"
             stepper.set_value("Étape 6")
@@ -2937,18 +3133,16 @@ def main_page():
             if state.installer_files:
                 state.is_loading = True
                 state.status_text = "⏳ Chargement installeurs..."
-                await asyncio.sleep(0)
-                if step_refresh_refs["installers_ui"]:
-                    step_refresh_refs["installers_ui"]()
+                await asyncio.sleep(0.05)
+                _safe_refresh("installers_ui", step_refresh_refs["installers_ui"])
                 state.is_loading = False
                 state.status_text = "✅ Prêt"
                 stepper.set_value("Étape 5")
                 return
             state.is_loading = True
             state.status_text = "⏳ Chargement résumé..."
-            await asyncio.sleep(0)
-            if step_refresh_refs["summary_ui"]:
-                step_refresh_refs["summary_ui"]()
+            await asyncio.sleep(0.05)
+            _safe_refresh("summary_ui", step_refresh_refs["summary_ui"])
             state.is_loading = False
             state.status_text = "✅ Prêt"
             stepper.set_value("Étape 6")
@@ -2956,9 +3150,8 @@ def main_page():
         async def go_from_step5():
             state.is_loading = True
             state.status_text = "⏳ Chargement résumé..."
-            await asyncio.sleep(0)
-            if step_refresh_refs["summary_ui"]:
-                step_refresh_refs["summary_ui"]()
+            await asyncio.sleep(0.05)
+            _safe_refresh("summary_ui", step_refresh_refs["summary_ui"])
             state.is_loading = False
             state.status_text = "✅ Prêt"
             stepper.set_value("Étape 6")
@@ -3970,6 +4163,48 @@ def main_page():
                                             state.nsfw_destination = folder
                                     ui.button(icon="folder_open", on_click=_pick_nsfw_dest).props("flat dense color=rose").tooltip("Choisir dossier")
 
+                            # ---- Barre Images : structure et destination dediee ----
+                            with ui.card().classes("w-full bg-gray-900/60 border border-cyan-900/50 p-3 gap-2"):
+                                with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                                    ui.icon("folder_special", size="1.2rem").classes("text-cyan-400")
+                                    ui.label("Structure des images").classes("text-sm font-bold text-cyan-300")
+
+                                    img_skip_date_chk = ui.checkbox(
+                                        "Sans structure de dates (YYYY-MM-DD)",
+                                        value=state.image_skip_date_hierarchy,
+                                    ).classes("text-xs text-cyan-200").tooltip(
+                                        "Copie/deplace les images directement dans un dossier plat, sans hierarchie annee-mois-jour."
+                                    )
+                                    img_skip_date_chk.on_value_change(
+                                        lambda e: setattr(state, "image_skip_date_hierarchy", bool(e.value))
+                                    )
+
+                                    img_folder_input = ui.input(
+                                        "Nom dossier (sans date)",
+                                        placeholder="ImagesDivers",
+                                        value=state.image_no_date_folder_name,
+                                    ).classes("w-40 text-xs")
+                                    img_folder_input.on_value_change(
+                                        lambda e: setattr(state, "image_no_date_folder_name", (e.value or "ImagesDivers").strip() or "ImagesDivers")
+                                    )
+
+                                with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                                    img_dest_input = ui.input(
+                                        "Destination dediee aux images (optionnel)",
+                                        placeholder="ex: D:\\Photos-Triees",
+                                        value=state.image_destination,
+                                    ).classes("flex-grow text-xs").tooltip(
+                                        "Si renseigne, toutes les images (Images + IA-Images) sont copiees ici au lieu de la destination principale. Les sidecars suivent."
+                                    )
+                                    img_dest_input.on_value_change(lambda e: setattr(state, "image_destination", (e.value or "").strip()))
+
+                                    async def _pick_image_dest():
+                                        folder = await select_folder_async()
+                                        if folder:
+                                            img_dest_input.set_value(folder)
+                                            state.image_destination = folder
+                                    ui.button(icon="folder_open", on_click=_pick_image_dest).props("flat dense color=cyan").tooltip("Choisir dossier")
+
                             # Sous-onglets IA / Vraies Photos
                             with ui.tabs().classes("w-full bg-gray-900/40 rounded-t") as img_sub_tabs:
                                 tab_ia  = ui.tab("IA Générées", icon="auto_awesome").props("no-caps")
@@ -4223,7 +4458,11 @@ def main_page():
 
                     # ===== TAB MUSIQUE & AUDIO =====
                     with ui.tab_panel(tab_music):
-                        with ui.column().classes("w-full gap-3 p-3"):
+                        music_tab_container = ui.column().classes("w-full gap-3 p-3")
+
+                    def _build_music_tab():
+                        music_tab_container.clear()
+                        with music_tab_container:
 
                             # Checkboxes sélection sous-catégories musique
                             music_subcats_data = state.scan_results.get("MUSIQUE-AUDIO", {})
@@ -4328,6 +4567,9 @@ def main_page():
 
                                 music_metadata_editor()
                                 music_metadata_refresh_ref['fn'] = music_metadata_editor.refresh
+
+                    _build_music_tab()
+                    step_refresh_refs["music_tab"] = _build_music_tab
 
                 with ui.stepper_navigation():
                     ui.button("← Retour", on_click=stepper.previous).props("flat color=gray")
@@ -5091,6 +5333,9 @@ def main_page():
                             video_overrides=state.video_output_overrides,
                             video_skip_date_hierarchy=state.video_skip_date_hierarchy,
                             video_no_date_folder_name=state.video_no_date_folder_name,
+                            image_skip_date_hierarchy=state.image_skip_date_hierarchy,
+                            image_no_date_folder_name=state.image_no_date_folder_name,
+                            image_destination=state.image_destination,
                         )
                         state.report = report
                         return report
@@ -6113,7 +6358,8 @@ if __name__ in {"__main__", "__mp_main__"}:
             native=False,
             show=False,
             dark=True,
-            reload=False
+            reload=False,
+            reconnect_timeout=30.0,
         )
     else:
         ui.run(
@@ -6122,5 +6368,6 @@ if __name__ in {"__main__", "__mp_main__"}:
             native=True,
             dark=True,
             window_size=(1400, 900),
-            reload=False
+            reload=False,
+            reconnect_timeout=30.0,
         )
