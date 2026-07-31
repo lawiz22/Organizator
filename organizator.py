@@ -987,11 +987,13 @@ class DiskScanner:
     @staticmethod
     def _resolve_companions(results: dict, uncategorized: list) -> None:
         """
-        Détecte les fichiers compagnons (.txt tags, .json même stem, _validation.json NSFW) des images.
+        Détecte les fichiers compagnons (.txt tags, .json même stem, _validation.json NSFW,
+        _aesthetic.json, _tags.json, _persons.json) des images.
         - Attache les chemins des compagnons à entry.companions
         - Lit le tier NSFW depuis _validation.json → entry.nsfw_status
         - Retire les compagnons de toutes les catégories / non-catégorisés
-        Les _validation.json sont TOUJOURS cachés du scan même sans image correspondante.
+        Les _validation.json / _aesthetic.json / _tags.json / _persons.json sont TOUJOURS cachés
+        du scan même sans image correspondante.
         """
         import json as _json
 
@@ -1011,11 +1013,15 @@ class DiskScanner:
             return (entry.ext.lower() == ".json" and
                     os.path.splitext(entry.name)[0].lower().endswith("_tags"))
 
+        def _is_persons_json(entry) -> bool:
+            return (entry.ext.lower() == ".json" and
+                    os.path.splitext(entry.name)[0].lower().endswith("_persons"))
+
         for cat in list(results.keys()):
             for subcat in list(results[cat].keys()):
                 kept, removed = [], []
                 for e in results[cat][subcat]:
-                    if _is_validation_json(e) or _is_aesthetic_json(e) or _is_tags_json(e):
+                    if _is_validation_json(e) or _is_aesthetic_json(e) or _is_tags_json(e) or _is_persons_json(e):
                         removed.append(e)
                     else:
                         kept.append(e)
@@ -1029,7 +1035,7 @@ class DiskScanner:
                 del results[cat]
 
         for i in range(len(uncategorized) - 1, -1, -1):
-            if _is_validation_json(uncategorized[i]) or _is_aesthetic_json(uncategorized[i]) or _is_tags_json(uncategorized[i]):
+            if _is_validation_json(uncategorized[i]) or _is_aesthetic_json(uncategorized[i]) or _is_tags_json(uncategorized[i]) or _is_persons_json(uncategorized[i]):
                 validation_entries.append(uncategorized[i])
                 del uncategorized[i]
 
@@ -1126,6 +1132,14 @@ class DiskScanner:
                     if img_entry:
                         img_entry.companions.append(candidate_path)
                         companion_paths.add(norm_candidate)
+                elif cstem_lower.endswith("_persons"):
+                    # {stem}_persons.json — sidecar de détection de visages (MediaMind AI)
+                    base_stem = cstem_lower[:-len("_persons")]
+                    key = (norm_dir, base_stem)
+                    img_entry = image_by_dir_stem.get(key)
+                    if img_entry:
+                        img_entry.companions.append(candidate_path)
+                        companion_paths.add(norm_candidate)
                 else:
                     # {stem}.json  → métadonnées / tags companion
                     key = (norm_dir, cstem_lower)
@@ -1166,6 +1180,7 @@ class DiskScanner:
                 img_stem + "_validation.json",
                 img_stem + "_aesthetic.json",
                 img_stem + "_tags.json",
+                img_stem + "_persons.json",
                 img_stem + ".ia",
             ):
                 candidate = os.path.join(real_dir, suffix)

@@ -1,4 +1,4 @@
-﻿import os
+import os
 
 try:
     from dotenv import load_dotenv
@@ -23,6 +23,7 @@ import asyncio
 import gc
 import time
 import json
+import re
 import shutil
 import hashlib
 import urllib.parse
@@ -234,6 +235,107 @@ def classify_nsfw_tier(details, threshold, portrait_guard=False):
 # Keep old name as alias so nothing else breaks
 def classify_nsfw_label(danger_score, threshold=None, portrait_guard=False):
     return 'SAIN' if portrait_guard or (danger_score or 0) < (threshold or NSFW_THRESHOLD) else 'EXPLICITE'
+
+
+# ==========================================
+# Classification NSFW à partir de prompt / tags (sidecar .txt ou metadata)
+# ==========================================
+# Mots-clés (insensibles à la casse, matche sur frontières de "mot" élargies aux
+# séparateurs typiques tags Booru/SD: espace, virgule, _, -, :)
+NSFW_PROMPT_EXPLICIT_KEYWORDS = (
+    'nsfw', 'porn', 'pornographic', 'pornography', 'xxx', 'hentai', 'rule34', 'rule_34',
+    'hardcore', 'explicit', 'explicit_content',
+    'sex', 'sexual', 'sexual_intercourse', 'intercourse', 'penetration', 'penetrated',
+    'fuck', 'fucking', 'fucked', 'gangbang', 'orgy', 'threesome',
+    'oral', 'blowjob', 'fellatio', 'deepthroat', 'cunnilingus', 'rimjob',
+    'anal', 'anal_sex', 'doggystyle', 'cowgirl', 'missionary',
+    'masturbation', 'fingering', 'handjob', 'footjob',
+    'cum', 'cumshot', 'cum_in_mouth', 'cum_on_face', 'creampie', 'ejaculation', 'semen',
+    'penis', 'cock', 'dick', 'erection', 'erect_penis',
+    'vagina', 'vulva', 'pussy', 'clitoris', 'labia',
+    'nude', 'nudity', 'naked', 'full_nudity', 'completely_nude', 'totally_nude',
+    'nude_female', 'nude_male', 'topless', 'bottomless',
+    'nipple', 'nipples', 'areola', 'areolae', 'bare_breasts', 'exposed_breasts',
+    'bare_chest', 'breasts_out',
+    'genitals', 'genitalia', 'pubic_hair', 'pubic',
+    'ass', 'anus', 'butthole',
+    'bdsm', 'bondage', 'bukkake', 'futanari', 'yuri', 'yaoi',
+    'loli', 'lolicon', 'shota', 'shotacon',
+)
+
+NSFW_PROMPT_SENSUAL_KEYWORDS = (
+    'sensual', 'sexy', 'erotic', 'erotica', 'seductive', 'seduction', 'suggestive',
+    'provocative', 'risque', 'risqué', 'racy', 'titillating', 'enticing',
+    'lingerie', 'underwear', 'undergarment', 'panties', 'panty', 'bra', 'brassiere',
+    'thong', 'g_string', 'g-string', 'garter', 'garter_belt', 'stockings',
+    'fishnet', 'fishnets', 'pantyhose',
+    'bikini', 'micro_bikini', 'sling_bikini', 'swimsuit', 'swimwear', 'one_piece_swimsuit',
+    'leotard', 'bodysuit', 'latex', 'latex_suit',
+    'cleavage', 'side_boob', 'sideboob', 'underboob', 'down_blouse',
+    'see_through', 'see-through', 'transparent_clothes', 'sheer',
+    'wet_shirt', 'wet_clothes', 'soaked',
+    'midriff', 'crop_top', 'short_shorts', 'mini_skirt', 'miniskirt', 'micro_skirt',
+    'thigh_high', 'thigh_highs', 'high_slit', 'side_slit',
+    'cameltoe', 'pokies', 'cleavage_cutout',
+    'ecchi', 'fanservice', 'pin_up', 'pinup',
+    'corset', 'bustier', 'babydoll', 'negligee', 'slip_dress',
+)
+
+
+def _nsfw_prompt_match(text_lower, keywords):
+    """Retourne la liste des mots-clés trouvés via une regex à frontières larges
+    (séparateurs: espace, virgule, point, _, -, :, /, |, parenthèses, fin de ligne)."""
+    if not text_lower:
+        return []
+    found = []
+    for kw in keywords:
+        kw_l = kw.lower()
+        # Echappement + frontière personnalisée: tout caractère non-[a-z0-9] OU bord
+        pattern = r'(?:(?<=^)|(?<=[^a-z0-9]))' + re.escape(kw_l) + r'(?=$|[^a-z0-9])'
+        if re.search(pattern, text_lower):
+            found.append(kw_l)
+    return found
+
+
+def classify_nsfw_by_prompt(text):
+    """Classe un texte (prompt ou tags concaténés) en SAIN/SENSUEL/EXPLICITE
+    via les listes de mots-clés. Retourne dict détails + tier + danger, ou None
+    si le texte est vide.
+
+    Précédence: EXPLICITE > SENSUEL > SAIN.
+    """
+    if not text or not isinstance(text, str):
+        return None
+    txt = text.strip().lower()
+    if not txt:
+        return None
+
+    explicit_hits = _nsfw_prompt_match(txt, NSFW_PROMPT_EXPLICIT_KEYWORDS)
+    sensual_hits = _nsfw_prompt_match(txt, NSFW_PROMPT_SENSUAL_KEYWORDS)
+
+    if explicit_hits:
+        tier = 'EXPLICITE'
+        danger = 0.95
+    elif sensual_hits:
+        tier = 'SENSUEL'
+        danger = 0.55
+    else:
+        tier = 'SAIN'
+        danger = 0.0
+
+    details = {
+        '_prompt_classified': 1.0,
+        '_prompt_tier': tier,
+        '_prompt_explicit_hits': ','.join(explicit_hits[:10]),
+        '_prompt_sensual_hits': ','.join(sensual_hits[:10]),
+    }
+    return {
+        'tier': tier,
+        'danger': danger,
+        'details': details,
+        'explicit_hits': explicit_hits,
+        'sensual_hits': sensual_hits,
+    }
 
 
 def aesthetic_score_to_percent(score):
@@ -2748,9 +2850,60 @@ class NsfwEngine:
         manual_tier = str((details or {}).get('_manual_tier', '')).upper() if isinstance(details, dict) else ''
         if manual_tier in {'SAIN', 'SENSUEL', 'EXPLICITE'}:
             return manual_tier
+        # Respect prompt/tag-based classification (sidecar .txt or metadata) when present.
+        if isinstance(details, dict) and details.get('_prompt_classified'):
+            prompt_tier = str(details.get('_prompt_tier', '')).upper()
+            if prompt_tier in {'SAIN', 'SENSUEL', 'EXPLICITE'}:
+                return prompt_tier
         return classify_nsfw_tier(details, state.nsfw_threshold, portrait_guard)
 
-    def evaluate_media(self, directory_path, model_name, allowed_exts, override_files=None, nsfw_mode=None):
+    @staticmethod
+    def _collect_prompt_or_tags(path):
+        """Réunit le texte du prompt + tags depuis sidecars (`{stem}_prompt.txt`,
+        `{stem}.txt`) ET la metadata embarquée (PNG info / EXIF). Renvoie
+        (texte_concaténé, source, has_sidecar) où source ∈ {'sidecar_prompt',
+        'sidecar_tags','metadata','sidecar+metadata',...}, has_sidecar=True si
+        au moins un sidecar a été lu, ou ('','',False) si rien."""
+        texts = []
+        sources = []
+        has_sidecar = False
+        try:
+            p = Path(path)
+            sc_prompt = p.with_name(f"{p.stem}_prompt.txt")
+            if sc_prompt.exists() and sc_prompt.is_file():
+                try:
+                    t = sc_prompt.read_text(encoding='utf-8', errors='ignore').strip()
+                    if t:
+                        texts.append(t)
+                        sources.append('sidecar_prompt')
+                        has_sidecar = True
+                except Exception:
+                    pass
+            sc_tags = p.with_suffix('.txt')
+            if sc_tags.exists() and sc_tags.is_file() and sc_tags != sc_prompt:
+                try:
+                    t = sc_tags.read_text(encoding='utf-8', errors='ignore').strip()
+                    if t:
+                        texts.append(t)
+                        sources.append('sidecar_tags')
+                        has_sidecar = True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Metadata (PNG info / EXIF)
+        try:
+            meta = TagEngine._extract_prompt_from_image_metadata(str(path))
+            if meta:
+                texts.append(meta)
+                sources.append('metadata')
+        except Exception:
+            pass
+        if not texts:
+            return '', '', False
+        return '\n'.join(texts), '+'.join(sources), has_sidecar
+
+    def evaluate_media(self, directory_path, model_name, allowed_exts, override_files=None, nsfw_mode=None, metadata_only_to_model=False):
         if override_files is None:
             # NSFW scan uses a fresh recursive walk to avoid stale dir_cache misses.
             all_files = []
@@ -2807,10 +2960,51 @@ class NsfwEngine:
 
         # Подготовка: фильтрация через кэш (LAZY LOADING)
         images_to_process =[]
+        prompt_classified_count = 0
+        metadata_only_forced_count = 0
+        total_to_scan = len(image_paths) + len(video_paths)
+        scan_progress_idx = 0
+        if total_to_scan > 0:
+            state.status_text = f"NSFW pré-scan prompt/tags (0/{total_to_scan})..."
+            state.progress = 0.0
         for p in image_paths:
-            cached = self.db_cache.get_nsfw_score(cache_key, p)
+            scan_progress_idx += 1
+            if scan_progress_idx % 5 == 0 or scan_progress_idx == total_to_scan:
+                state.status_text = f"NSFW pré-scan prompt/tags ({scan_progress_idx}/{total_to_scan}) : {Path(p).name}"
+                state.progress = scan_progress_idx / max(1, total_to_scan)
             if p in checkpoint_by_path:
                 continue
+            # PRÉ-FILTRE PROMPT/TAGS: si un sidecar .txt/_prompt.txt ou la metadata
+            # contient déjà un prompt/tags, on classe par mots-clés et on saute le modèle.
+            try:
+                prompt_text, prompt_source, has_sidecar = self._collect_prompt_or_tags(p)
+            except Exception:
+                prompt_text, prompt_source, has_sidecar = '', '', False
+            # Option: si seule la metadata est dispo (pas de sidecar tag/prompt) et
+            # que l'utilisateur veut forcer le modèle dans ce cas, on ignore la metadata.
+            if prompt_text and metadata_only_to_model and not has_sidecar:
+                metadata_only_forced_count += 1
+                prompt_text = ''
+            if prompt_text:
+                verdict = classify_nsfw_by_prompt(prompt_text)
+                if verdict is not None:
+                    details_dict = dict(verdict['details'])
+                    details_dict['_prompt_source'] = prompt_source
+                    details_dict['_raw_top_label'] = f"prompt:{verdict['tier'].lower()}"
+                    danger = float(verdict['danger'])
+                    label = verdict['tier']
+                    state.add_log(
+                        f"[NSFW] Prompt/tags ({prompt_source}) → {label}: {Path(p).name}"
+                        + (f" | explicit={details_dict.get('_prompt_explicit_hits','')}"
+                           if details_dict.get('_prompt_explicit_hits') else '')
+                        + (f" | sensual={details_dict.get('_prompt_sensual_hits','')}"
+                           if details_dict.get('_prompt_sensual_hits') else '')
+                    )
+                    self.db_cache.save_nsfw_score(cache_key, p, details_dict['_raw_top_label'], danger, details_dict)
+                    record_result((danger, p, label, details_dict))
+                    prompt_classified_count += 1
+                    continue
+            cached = self.db_cache.get_nsfw_score(cache_key, p)
             if cached is not None:
                 details_dict = json.loads(cached[2]) if cached[2] else {}
                 details_dict.setdefault('_raw_top_label', cached[0])
@@ -2821,9 +3015,35 @@ class NsfwEngine:
 
         videos_to_process =[]
         for p in video_paths:
-            cached = self.db_cache.get_nsfw_score(cache_key, p)
+            scan_progress_idx += 1
+            if scan_progress_idx % 5 == 0 or scan_progress_idx == total_to_scan:
+                state.status_text = f"NSFW pré-scan prompt/tags ({scan_progress_idx}/{total_to_scan}) : {Path(p).name}"
+                state.progress = scan_progress_idx / max(1, total_to_scan)
             if p in checkpoint_by_path:
                 continue
+            try:
+                prompt_text, prompt_source, has_sidecar = self._collect_prompt_or_tags(p)
+            except Exception:
+                prompt_text, prompt_source, has_sidecar = '', '', False
+            if prompt_text and metadata_only_to_model and not has_sidecar:
+                metadata_only_forced_count += 1
+                prompt_text = ''
+            if prompt_text:
+                verdict = classify_nsfw_by_prompt(prompt_text)
+                if verdict is not None:
+                    details_dict = dict(verdict['details'])
+                    details_dict['_prompt_source'] = prompt_source
+                    details_dict['_raw_top_label'] = f"prompt:{verdict['tier'].lower()}"
+                    danger = float(verdict['danger'])
+                    label = verdict['tier']
+                    state.add_log(
+                        f"[NSFW] Prompt/tags ({prompt_source}) → {label}: {Path(p).name}"
+                    )
+                    self.db_cache.save_nsfw_score(cache_key, p, details_dict['_raw_top_label'], danger, details_dict)
+                    record_result((danger, p, label, details_dict))
+                    prompt_classified_count += 1
+                    continue
+            cached = self.db_cache.get_nsfw_score(cache_key, p)
             if cached is not None:
                 details_dict = json.loads(cached[2]) if cached[2] else {}
                 details_dict.setdefault('_raw_top_label', cached[0])
@@ -2831,10 +3051,16 @@ class NsfwEngine:
             else:
                 videos_to_process.append(p)
 
-        cached_count = (len(image_paths) - len(images_to_process)) + (len(video_paths) - len(videos_to_process))
+        if prompt_classified_count > 0:
+            state.add_log(f"[NSFW] Classés via prompt/tags (sidecar/metadata): {prompt_classified_count} fichiers (modèle ignoré)")
+        if metadata_only_forced_count > 0:
+            state.add_log(f"[NSFW] Forcés vers le modèle (metadata seule, pas de sidecar): {metadata_only_forced_count} fichiers")
+        cached_count = (len(image_paths) - len(images_to_process) - prompt_classified_count) + (len(video_paths) - len(videos_to_process))
         if cached_count > 0:
             state.add_log(f"[NSFW] Cache réutilisé: {cached_count} fichiers")
         state.add_log(f"[NSFW] À analyser: {len(images_to_process)} images, {len(videos_to_process)} vidéos")
+        # Reset progress avant la phase modèle
+        state.progress = 0.0
                 
         # Если все есть в базе, модель не грузим в VRAM
         if images_to_process or videos_to_process:
@@ -3111,6 +3337,11 @@ class FaceEngine:
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     def extract_faces(self, img_path):
+        """Retourne uniquement la liste des embeddings (compat. anciennes API)."""
+        return [item['embedding'] for item in self.extract_faces_full(img_path)]
+
+    def extract_faces_full(self, img_path):
+        """Retourne [{'embedding': np.ndarray, 'bbox': [x,y,w,h], 'det_score': float}, ...]."""
         try:
             # Lire via PIL pour éviter les problèmes de chemins Unicode.
             img = Image.open(img_path).convert('RGB')
@@ -3119,7 +3350,20 @@ class FaceEngine:
             img_arr = np.array(img)
             img_bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
             faces = self.app.get(img_bgr)
-            return [f.embedding for f in faces]
+            out = []
+            for f in faces:
+                bbox = getattr(f, 'bbox', None)
+                if bbox is not None:
+                    try:
+                        x1, y1, x2, y2 = [float(v) for v in bbox]
+                        bbox_xywh = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+                    except Exception:
+                        bbox_xywh = None
+                else:
+                    bbox_xywh = None
+                det_score = float(getattr(f, 'det_score', 0.0) or 0.0)
+                out.append({'embedding': f.embedding, 'bbox': bbox_xywh, 'det_score': det_score})
+            return out
         except Exception as e:
             err_text = str(e)
             cuda_markers = (
@@ -3136,7 +3380,20 @@ class FaceEngine:
                     img_arr = np.array(img)
                     img_bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
                     faces = self.app.get(img_bgr)
-                    return [f.embedding for f in faces]
+                    out = []
+                    for f in faces:
+                        bbox = getattr(f, 'bbox', None)
+                        if bbox is not None:
+                            try:
+                                x1, y1, x2, y2 = [float(v) for v in bbox]
+                                bbox_xywh = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+                            except Exception:
+                                bbox_xywh = None
+                        else:
+                            bbox_xywh = None
+                        det_score = float(getattr(f, 'det_score', 0.0) or 0.0)
+                        out.append({'embedding': f.embedding, 'bbox': bbox_xywh, 'det_score': det_score})
+                    return out
                 except Exception as retry_e:
                     state.add_log(f"Erreur extraction visages {Path(img_path).name} (retry CPU) : {retry_e}")
                     return []
@@ -3266,6 +3523,325 @@ class FaceEngine:
                     
                 self.db_cache.save_face_embeddings_batch(batch_db_data)
                 batch_paths =[]
+
+    # ------------------------------------------------------------------
+    # Recherche multi-profils (ProfileManager)
+    # ------------------------------------------------------------------
+    def search_faces_multi(self, profiles, directory_path, allowed_exts, threshold,
+                           override_files=None, mode='multi'):
+        """Recherche les visages dans un dossier contre une ou plusieurs identités.
+
+        profiles : liste de dicts {'name': str, 'centroid': np.ndarray (normalisé),
+                   'ref_count': int, 'profile_dir': str}
+        mode     : 'multi' (chaque visage est attribué au meilleur profil au-dessus
+                   du seuil) ou 'single' (1 seul profil → ne garde que les fichiers
+                   avec un visage qui matche).
+
+        Retourne (results, persons_by_path) :
+          - results = [(best_score, path), ...] trié décroissant
+          - persons_by_path = {path: [{'profile':..., 'confidence':..., 'bbox':...}, ...]}
+        """
+        if not profiles:
+            raise Exception("Aucun profil chargé !")
+        self.load_model()
+
+        # Tableau (P, D) des centroïdes normalisés
+        names = [pr['name'] for pr in profiles]
+        centroids = np.stack([pr['centroid'] for pr in profiles], axis=0).astype(np.float32)
+        # Déjà normalisés à la sortie du ProfileManager mais on s'assure
+        norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        centroids = centroids / norms
+
+        all_files = (self.se._gather_files(directory_path, allowed_exts)
+                     if override_files is None
+                     else [f for f in override_files if f.lower().endswith(allowed_exts)])
+
+        results = []
+        persons_by_path = {}
+        # bbox des nouveaux fichiers (cache embeddings ne stocke pas les bbox).
+        bbox_by_path = {}
+
+        def assign_faces_to_profiles(faces_data, path):
+            """faces_data: liste [{'embedding':..., 'bbox':...}] ou liste d'embeddings.
+            Retourne (best_score, persons_list)."""
+            persons = []
+            best = -1.0
+            for fd in faces_data:
+                if isinstance(fd, dict):
+                    emb = fd.get('embedding')
+                    bbox = fd.get('bbox')
+                else:
+                    emb = fd
+                    bbox = None
+                if emb is None:
+                    continue
+                emb = np.asarray(emb, dtype=np.float32)
+                n = float(np.linalg.norm(emb))
+                if n == 0.0:
+                    continue
+                emb_n = emb / n
+                sims = centroids @ emb_n  # (P,)
+                best_idx = int(np.argmax(sims))
+                best_sim = float(sims[best_idx])
+                if best_sim >= threshold:
+                    persons.append({
+                        'profile': names[best_idx],
+                        'confidence': best_sim,
+                        'bbox': bbox,
+                    })
+                    if best_sim > best:
+                        best = best_sim
+            return best, persons
+
+        images_to_process = []
+
+        # 1. Cache : embeddings déjà extraits (pas de bbox)
+        for p in all_files:
+            cached = self.db_cache.get_face_embeddings(p)
+            if cached is not None:
+                if len(cached) > 0:
+                    best, persons = assign_faces_to_profiles(cached, p)
+                    if persons:
+                        results.append((float(best), p))
+                        persons_by_path[p] = persons
+                # rien matché → on n'inclut pas
+            else:
+                images_to_process.append(p)
+
+        # 2. Nouveaux fichiers
+        if images_to_process:
+            state.add_log(f"[FACE] Extraction multi-profils pour {len(images_to_process)} fichiers...")
+            batch_paths = []
+            for i, p in enumerate(images_to_process):
+                if not state.is_processing:
+                    break
+                batch_paths.append(p)
+                if len(batch_paths) >= self.batch_size or i == len(images_to_process) - 1:
+                    state.progress = (i + 1) / max(1, len(images_to_process))
+                    state.status_text = f"Visages multi-profils ({i+1}/{len(images_to_process)})..."
+                    batch_db_data = []
+                    for path in batch_paths:
+                        ext = os.path.splitext(path)[1].lower()
+                        faces_data = []
+                        if ext in SUPPORTED_IMAGES:
+                            faces_data = self.extract_faces_full(path)
+                        elif ext in SUPPORTED_VIDEOS:
+                            frames = media_cache.get_video_frames(path, 640, 1)
+                            if frames and len(frames) > 0:
+                                try:
+                                    img_arr = np.array(frames[0])
+                                    img_bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
+                                    faces = self.app.get(img_bgr)
+                                    for f in faces:
+                                        bbox = getattr(f, 'bbox', None)
+                                        if bbox is not None:
+                                            try:
+                                                x1, y1, x2, y2 = [float(v) for v in bbox]
+                                                bbox_xywh = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+                                            except Exception:
+                                                bbox_xywh = None
+                                        else:
+                                            bbox_xywh = None
+                                        faces_data.append({'embedding': f.embedding, 'bbox': bbox_xywh})
+                                except Exception as e:
+                                    state.add_log(f"[FACE] Erreur frame vidéo {Path(path).name}: {e}")
+                        batch_db_data.append((path, [fd['embedding'] for fd in faces_data]))
+                        if faces_data:
+                            best, persons = assign_faces_to_profiles(faces_data, path)
+                            if persons:
+                                results.append((float(best), path))
+                                persons_by_path[path] = persons
+                                bbox_by_path[path] = [fd.get('bbox') for fd in faces_data]
+                    self.db_cache.save_face_embeddings_batch(batch_db_data)
+                    batch_paths = []
+
+        results.sort(key=lambda x: x[0], reverse=True)
+        return results, persons_by_path, bbox_by_path
+
+
+# --- GESTION DES PROFILS (visages connus) ---
+class ProfileManager:
+    """Gère un répertoire de profils où chaque sous-dossier == 1 personne.
+
+        Layout attendu :
+                {profiles_dir}/
+                        kathleen/
+                                photo1.jpg
+                                photo2.jpg
+                                .profile_embedding.npy   (cache du centroïde, généré auto)
+                                .profile_meta.json       (refs utilisées + version)
+                        marc/ ...
+    """
+
+    PROFILE_META_VER = 'organizador.face_profile.v1'
+    META_FNAME = '.profile_meta.json'
+    EMB_FNAME = '.profile_embedding.npy'
+
+    def __init__(self, face_engine):
+        self.fe = face_engine
+        self.profiles_dir = ''
+
+    def set_profiles_dir(self, path):
+        self.profiles_dir = path or ''
+
+    def list_profiles(self):
+        if not self.profiles_dir or not os.path.isdir(self.profiles_dir):
+            return []
+        out = []
+        for entry in sorted(os.listdir(self.profiles_dir)):
+            full = os.path.join(self.profiles_dir, entry)
+            if os.path.isdir(full) and not entry.startswith('.') and not entry.startswith('_'):
+                out.append(entry)
+        return out
+
+    def create_profile(self, name):
+        if not self.profiles_dir:
+            raise Exception("Répertoire de profils non configuré.")
+        safe = ''.join(ch for ch in (name or '').strip() if ch.isalnum() or ch in (' ', '_', '-')).strip()
+        if not safe:
+            raise Exception("Nom de profil invalide.")
+        target = os.path.join(self.profiles_dir, safe)
+        os.makedirs(target, exist_ok=True)
+        return safe, target
+
+    def list_profile_photos(self, name):
+        target = os.path.join(self.profiles_dir, name)
+        if not os.path.isdir(target):
+            return []
+        return [
+            os.path.join(target, f)
+            for f in sorted(os.listdir(target))
+            if f.lower().endswith(SUPPORTED_IMAGES) and not f.startswith('.')
+        ]
+
+    def _profile_meta_path(self, name):
+        return os.path.join(self.profiles_dir, name, self.META_FNAME)
+
+    def _profile_emb_path(self, name):
+        return os.path.join(self.profiles_dir, name, self.EMB_FNAME)
+
+    def _load_cached_centroid(self, name, photos):
+        meta_p = self._profile_meta_path(name)
+        emb_p = self._profile_emb_path(name)
+        if not (os.path.isfile(meta_p) and os.path.isfile(emb_p)):
+            return None
+        try:
+            with open(meta_p, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+            if meta.get('schema') != self.PROFILE_META_VER:
+                return None
+            cached_refs = sorted(meta.get('refs', []))
+            current_refs = sorted(os.path.basename(p) for p in photos)
+            if cached_refs != current_refs:
+                return None
+            centroid = np.load(emb_p).astype(np.float32)
+            return {
+                'name': name,
+                'centroid': centroid,
+                'ref_count': int(meta.get('ref_count', len(photos))),
+                'profile_dir': os.path.join(self.profiles_dir, name),
+            }
+        except Exception:
+            return None
+
+    def _save_cached_centroid(self, name, photos, centroid, used_refs):
+        try:
+            np.save(self._profile_emb_path(name), centroid.astype(np.float32))
+            meta = {
+                'schema': self.PROFILE_META_VER,
+                'name': name,
+                'ref_count': int(used_refs),
+                'refs': [os.path.basename(p) for p in photos],
+                'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            with open(self._profile_meta_path(name), 'w', encoding='utf-8') as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            state.add_log(f"[FACE/profil] Cache centroïde non écrit pour '{name}': {e}")
+
+    def build_profile(self, name, force=False):
+        """Calcule (ou recharge) le centroïde d'un profil. Retourne dict ou None."""
+        photos = self.list_profile_photos(name)
+        if not photos:
+            state.add_log(f"[FACE/profil] '{name}' : aucune photo → profil ignoré.")
+            return None
+        if not force:
+            cached = self._load_cached_centroid(name, photos)
+            if cached is not None:
+                return cached
+
+        self.fe.load_model()
+        embs = []
+        for p in photos:
+            faces = self.fe.extract_faces_full(p)
+            if not faces:
+                state.add_log(f"[FACE/profil] '{name}' : pas de visage dans {os.path.basename(p)}")
+                continue
+            # Prend le visage le + grand (det_score ou aire bbox)
+            faces.sort(key=lambda f: (f.get('det_score', 0.0),
+                                      (f.get('bbox', [0, 0, 0, 0]) or [0, 0, 0, 0])[2] *
+                                      (f.get('bbox', [0, 0, 0, 0]) or [0, 0, 0, 0])[3]),
+                       reverse=True)
+            emb = np.asarray(faces[0]['embedding'], dtype=np.float32)
+            n = float(np.linalg.norm(emb))
+            if n > 0:
+                embs.append(emb / n)
+        if not embs:
+            state.add_log(f"[FACE/profil] '{name}' : aucun embedding utilisable.")
+            return None
+        centroid = np.mean(np.stack(embs, axis=0), axis=0).astype(np.float32)
+        n = float(np.linalg.norm(centroid))
+        if n > 0:
+            centroid = centroid / n
+        self._save_cached_centroid(name, photos, centroid, len(embs))
+        state.add_log(f"[FACE/profil] '{name}' : centroïde calculé sur {len(embs)} photo(s).")
+        return {
+            'name': name,
+            'centroid': centroid,
+            'ref_count': len(embs),
+            'profile_dir': os.path.join(self.profiles_dir, name),
+        }
+
+    def build_profiles(self, names, force=False):
+        out = []
+        for n in names:
+            try:
+                pr = self.build_profile(n, force=force)
+                if pr is not None:
+                    out.append(pr)
+            except Exception as e:
+                state.add_log(f"[FACE/profil] Erreur '{n}' : {e}")
+        return out
+
+
+def write_persons_sidecar(media_path, persons, threshold):
+    """Écrit `{stem}_persons.json` à côté du média."""
+    try:
+        stem = os.path.splitext(media_path)[0]
+        out_path = stem + '_persons.json'
+        payload = {
+            'schema': 'organizador.persons.v1',
+            'media': os.path.basename(media_path),
+            'threshold': float(threshold),
+            'detected': [
+                {
+                    'profile': str(p.get('profile', '')),
+                    'confidence': float(p.get('confidence', 0.0)),
+                    'bbox': p.get('bbox'),
+                }
+                for p in persons
+            ],
+            'unknown_faces': 0,
+            'written_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        # Atomic write
+        tmp = out_path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, out_path)
+    except Exception as e:
+        state.add_log(f"[FACE/sidecar] Erreur écriture {os.path.basename(media_path)}_persons.json : {e}")
 
 # --- ДВИЖОК ТЕГИРОВАНИЯ DANBOORU ---
 class TagEngine:
@@ -4154,47 +4730,156 @@ class TagEngine:
         
         state.add_log(f"Trouve pour tagging: {len(image_paths)} photos, {len(video_paths)} videos.")
         cache_key = f"{model_name}_{self.video_frames}"
-        
+
         images_to_process, videos_to_process = [],[]
         metadata_prompted = 0
-        
-        for p in image_paths:
-            cached_tags = self.db_cache.get_tags(cache_key, p)
-            # Skip only if tags already exist in cache. Having a cached prompt is NOT a reason to skip tag generation.
-            if cached_tags is None or len(cached_tags) == 0:
-                # 1) Prompt embarqué dans les métadonnées de l'image (ComfyUI/A1111)
+
+        # --- BULK PRELOAD ---------------------------------------------------
+        # Évite N requêtes SQL + N ouvertures de fichier sur de gros lots (ex: 9119 photos).
+        # On charge en une fois : tags cachés, prompts cachés, détections IA cachées.
+        def _bulk_fetch_in(table_query, paths, params_prefix=()):
+            """Exécute table_query avec un IN(?,?,..) découpé en lots ≤ 900 (limite SQLite).
+            table_query doit contenir un placeholder '{IN}' à remplacer."""
+            results = []
+            if not paths: return results
+            cur = self.db_cache.conn.cursor()
+            CHUNK = 900
+            for i in range(0, len(paths), CHUNK):
+                sub = paths[i:i+CHUNK]
+                q = table_query.replace('{IN}', ','.join('?' * len(sub)))
+                cur.execute(q, list(params_prefix) + list(sub))
+                results.extend(cur.fetchall())
+            return results
+
+        try:
+            cached_tags_set = set()
+            for (p_, tags_json) in _bulk_fetch_in(
+                "SELECT path, tags FROM tags_cache WHERE model=? AND path IN ({IN})",
+                image_paths + video_paths,
+                params_prefix=(cache_key,)
+            ):
+                if tags_json:
+                    try:
+                        d = json.loads(tags_json)
+                        if d and len(d) > 0:
+                            cached_tags_set.add(p_)
+                    except Exception:
+                        pass
+
+            cached_prompt_set = set()
+            for (p_, prompt_text) in _bulk_fetch_in(
+                "SELECT path, prompt FROM prompt_cache WHERE path IN ({IN})",
+                image_paths
+            ):
+                if prompt_text and str(prompt_text).strip():
+                    cached_prompt_set.add(p_)
+
+            cached_ia_set = set(
+                row[0] for row in _bulk_fetch_in(
+                    "SELECT path FROM ai_detection_cache WHERE path IN ({IN})",
+                    image_paths
+                )
+            )
+        except Exception as _bulk_err:
+            state.add_log(f"[TAGS] bulk preload fallback (lookup unitaire): {_bulk_err}")
+            cached_tags_set = set()
+            cached_prompt_set = set()
+            cached_ia_set = set()
+
+        # --- IMPORT depuis sidecars _tags.json existants ----------------------
+        # Si la DB a été vidée ou si on travaille sur un nouveau folder qui contient
+        # déjà des _tags.json (run précédent interrompu), on les ré-importe pour
+        # éviter de tout recalculer.
+        try:
+            sidecar_imports = []  # (cache_key, path, tags_dict) pour save_tags_batch
+            sidecar_skipped = 0
+            for p in image_paths + video_paths:
+                if p in cached_tags_set:
+                    continue
+                try:
+                    pp = Path(p)
+                    sj = pp.with_name(f"{pp.stem}_tags.json")
+                    if not sj.exists():
+                        continue
+                    raw = sj.read_text(encoding='utf-8', errors='ignore')
+                    if not raw.strip():
+                        continue
+                    data = json.loads(raw)
+                    tags_block = data.get('tags') if isinstance(data, dict) else None
+                    if not isinstance(tags_block, dict) or not tags_block:
+                        continue
+                    # tags_block: {tag: "78.50%"} → reconvertir en float [0..1]
+                    tags_dict = {}
+                    for k, v in tags_block.items():
+                        try:
+                            if isinstance(v, str) and v.endswith('%'):
+                                f = float(v[:-1].strip()) / 100.0
+                            else:
+                                f = float(v)
+                                if f > 1.0: f = f / 100.0
+                            if f >= self.min_save_threshold:
+                                tags_dict[str(k)] = f
+                        except Exception:
+                            continue
+                    if tags_dict:
+                        sidecar_imports.append((cache_key, p, tags_dict))
+                        cached_tags_set.add(p)
+                        sidecar_skipped += 1
+                except Exception:
+                    continue
+            if sidecar_imports:
+                # Ré-injection dans la DB en lots de 500 pour éviter une grosse transaction
+                CHUNK_SC = 500
+                for i in range(0, len(sidecar_imports), CHUNK_SC):
+                    self.db_cache.save_tags_batch(sidecar_imports[i:i+CHUNK_SC])
+                state.add_log(f"[TAGS] {sidecar_skipped} sidecar(s) _tags.json ré-importé(s) dans la DB (skip recalcul).")
+        except Exception as _sc_err:
+            state.add_log(f"[TAGS] erreur import sidecars: {_sc_err}")
+
+        n_imgs = len(image_paths)
+        skipped_cached = 0
+        for idx, p in enumerate(image_paths):
+            if p in cached_tags_set:
+                skipped_cached += 1
+                continue
+            # 1) Prompt embarqué : on évite d'ouvrir l'image si un prompt est déjà en cache
+            if p not in cached_prompt_set:
                 embedded_prompt = self._extract_prompt_from_image_metadata(p)
                 if embedded_prompt:
                     self.db_cache.save_prompt(p, embedded_prompt, source="image_metadata_positive_prompt")
                     metadata_prompted += 1
                 else:
                     # 2) Fallback: sidecar .txt à côté du fichier (SD WebUI / kohya / _prompt.txt)
-                    existing = self.db_cache.get_prompt(p) or {}
-                    if not str(existing.get('text') or '').strip():
-                        txt_prompt = self._read_sidecar_prompt_txt(p)
-                        if txt_prompt:
-                            self.db_cache.save_prompt(p, txt_prompt, source="file_sidecar")
-                            metadata_prompted += 1
-                # 3) Sidecar .ia : pré-population du cache détection IA (sans Ollama)
+                    txt_prompt = self._read_sidecar_prompt_txt(p)
+                    if txt_prompt:
+                        self.db_cache.save_prompt(p, txt_prompt, source="file_sidecar")
+                        metadata_prompted += 1
+            # 3) Sidecar .ia : pré-population du cache détection IA (sans Ollama)
+            if p not in cached_ia_set:
                 try:
-                    if self.db_cache.get_ai_detection(p) is None:
-                        ia_side = self._read_sidecar_ia(p)
-                        if ia_side and ia_side.get('is_ai') is not None:
-                            self.db_cache.save_ai_detection(
-                                p,
-                                bool(ia_side.get('is_ai')),
-                                float(ia_side.get('confidence', 0.0) or 0.0),
-                                str(ia_side.get('method', 'sidecar')),
-                                ia_side,
-                            )
+                    ia_side = self._read_sidecar_ia(p)
+                    if ia_side and ia_side.get('is_ai') is not None:
+                        self.db_cache.save_ai_detection(
+                            p,
+                            bool(ia_side.get('is_ai')),
+                            float(ia_side.get('confidence', 0.0) or 0.0),
+                            str(ia_side.get('method', 'sidecar')),
+                            ia_side,
+                        )
                 except Exception:
                     pass
-                images_to_process.append(p)
+            images_to_process.append(p)
+            # Log progressif tous les 1000 fichiers pour rassurer l'utilisateur
+            if n_imgs > 2000 and (idx + 1) % 1000 == 0:
+                state.add_log(f"[TAGS] préparation: {idx+1}/{n_imgs} ({len(images_to_process)} à traiter, {skipped_cached} déjà en cache)")
+
+        if n_imgs > 2000:
+            state.add_log(f"[TAGS] prêt: {len(images_to_process)} à traiter, {skipped_cached} déjà en cache.")
+
         for p in video_paths:
-            cached_tags = self.db_cache.get_tags(cache_key, p)
-            # Reprocess if missing OR previously failed and stored as empty dict.
-            if cached_tags is None or len(cached_tags) == 0:
-                videos_to_process.append(p)
+            if p in cached_tags_set:
+                continue
+            videos_to_process.append(p)
 
         if metadata_prompted:
             state.add_log(
@@ -4373,6 +5058,18 @@ class AppState:
         self.sel_face = {}
         self.sel_tags = {}
         self.sel_prompt = {}
+        # --- Recherche par visage : profils ---
+        self.face_persons = {}        # {path: [{'profile':..., 'confidence':..., 'bbox':[x,y,w,h]}, ...]}
+        self.face_search_mode = 'multi'  # 'single' (1 profil) | 'multi' (tous)
+        self.face_active_profile = ''   # nom du profil sélectionné en mode 'single'
+        self.face_profile_filter = 'Tout'  # filtre galerie par nom de profil détecté
+        self.face_sort = 'score'           # 'score' | 'name_asc' | 'name_desc' | 'profile'
+        self.face_per_page = 40
+        self.face_compact = False
+        self.face_nsfw_filter = 'Tout'     # Tout | Sain | Sensuel | Explicit | Non validé
+        self.face_search = ''
+        self.face_show_undetected = False
+        self.face_undetected_paths = []    # [path, ...] médias scannés sans détection / sous seuil
 
         # Wizard de génération multi-photos (mode séquentiel: 1 photo à la fois)
         self.prompt_wizard_queue = []   # liste des chemins restant à traiter (incluant le courant)
@@ -4479,6 +5176,7 @@ search_engine = SearchEngine(
 aesthetic_engine = AestheticEngine(search_engine)
 nsfw_engine = NsfwEngine(search_engine)
 face_engine = FaceEngine(search_engine)
+profile_manager = ProfileManager(face_engine)
 tag_engine = TagEngine(search_engine)
 
 # --- Helpers d'indexation de masse (IA + Prompt) ---
@@ -4756,6 +5454,16 @@ async def select_file(input_element):
     file = await run.io_bound(pick_file_native)
     if file: input_element.value = file
 
+def pick_files_native():
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.attributes('-topmost', True)
+    root.withdraw()
+    files = filedialog.askopenfilenames(filetypes=[("Image files", "*.jpg *.jpeg *.png *.webp *.bmp *.tiff")])
+    root.destroy()
+    return list(files) if files else []
+
 def clear_folder_cache(folder_path):
     if not folder_path: return
     normalized_target = os.path.normcase(os.path.normpath(folder_path))
@@ -4957,7 +5665,7 @@ def show_exif_dialog(path: str) -> None:
 # --- ACTIONS FICHIER (Supprimer / Copier vers / Déplacer vers) ----------------
 _COMPANION_SUFFIXES = (
     '_validation.json', '_aesthetic.json', '_tags.json', '_tags.txt',
-    '_prompt.txt', '.txt', '.json', '.ia',
+    '_prompt.txt', '_persons.json', '.txt', '.json', '.ia',
 )
 
 
@@ -5207,17 +5915,43 @@ def index_page():
     ui.colors(primary='#2563eb', secondary='#10b981', accent='#f59e0b', dark='#1e1e2f')
     ui.query('body').classes('bg-[#121212] text-white overflow-hidden m-0 p-0')
 
+    # --- Style des onglets : rendre l'onglet actif TRÈS visible (couleur dédiée par onglet) ---
+    ui.add_head_html('''
+    <style>
+    /* Onglets inactifs : opacité réduite */
+    .q-tabs .q-tab { opacity: 0.45; transition: all 0.18s ease; border-bottom: 3px solid transparent; }
+    .q-tabs .q-tab:hover { opacity: 0.85; background: rgba(255,255,255,0.04); }
+    /* Onglet actif : fond coloré + barre épaisse + label/icone gros + ombre */
+    .q-tabs .q-tab--active {
+        opacity: 1 !important;
+        font-weight: 800 !important;
+        letter-spacing: 0.5px;
+        box-shadow: inset 0 -3px 0 0 currentColor;
+    }
+    .q-tabs .q-tab--active .q-tab__icon { transform: scale(1.25); transition: transform 0.18s; }
+    /* Couleurs par onglet (ordre : NSFW, IA, Tags, Prompt, Face, Aesthetic, Search, Cache) */
+    .q-tabs .q-tab:nth-child(1).q-tab--active { color: #f87171 !important; background: rgba(239,68,68,0.18); }
+    .q-tabs .q-tab:nth-child(2).q-tab--active { color: #f472b6 !important; background: rgba(236,72,153,0.18); }
+    .q-tabs .q-tab:nth-child(3).q-tab--active { color: #fbbf24 !important; background: rgba(245,158,11,0.18); }
+    .q-tabs .q-tab:nth-child(4).q-tab--active { color: #818cf8 !important; background: rgba(99,102,241,0.20); }
+    .q-tabs .q-tab:nth-child(5).q-tab--active { color: #2dd4bf !important; background: rgba(20,184,166,0.18); }
+    .q-tabs .q-tab:nth-child(6).q-tab--active { color: #facc15 !important; background: rgba(234,179,8,0.18); }
+    .q-tabs .q-tab:nth-child(7).q-tab--active { color: #60a5fa !important; background: rgba(37,99,235,0.20); }
+    .q-tabs .q-tab:nth-child(8).q-tab--active { color: #94a3b8 !important; background: rgba(100,116,139,0.20); }
+    </style>
+    ''')
+
     with ui.header().classes('bg-gray-900 border-b border-gray-800 flex justify-between items-center px-4 py-0 shrink-0 h-[60px]'):
         ui.label('🤖 AI Media Organizer Pro').classes('text-xl font-bold tracking-wider text-blue-400 shrink-0')
         
         with ui.tabs().bind_value(state, 'current_tab').classes('h-full') as tabs:
-            tab_search = ui.tab('Search', label='Recherche IA', icon='search')
-            tab_aesthetic = ui.tab('Aesthetic', label='Esthétique', icon='star')
             tab_nsfw = ui.tab('NSFW', label='Détecteur NSFW', icon='visibility_off')
-            tab_face = ui.tab('Face', label='Recherche Visage', icon='face')
+            tab_ia = ui.tab('IA', label='Détecteur IA', icon='auto_awesome')
             tab_tags = ui.tab('Tags', label='Tags Danbooru', icon='label')
             tab_prompt = ui.tab('Prompt', label='Prompts', icon='article')
-            tab_ia = ui.tab('IA', label='Détecteur IA', icon='auto_awesome')
+            tab_face = ui.tab('Face', label='Recherche Visage', icon='face')
+            tab_aesthetic = ui.tab('Aesthetic', label='Esthétique', icon='star')
+            tab_search = ui.tab('Search', label='Recherche IA', icon='search')
             tab_cache = ui.tab('Cache', label='Indexeur', icon='storage')
             
         ui.button(icon='settings', on_click=lambda: global_settings_dialog.open()).props('flat round dense text-color=white').classes('shrink-0').tooltip('Paramètres généraux')
@@ -5852,7 +6586,11 @@ def index_page():
         base_dir = getattr(state, f"{tab}_base_dir", state.search_base_dir)
         success = 0
         moved_paths = set()
-        
+        # Pour le tab face : si une photo a >1 profil et action=copy, on duplique
+        # vers chaque sous-dossier de profil. En mode 'move', on déplace dans
+        # le profil au meilleur score, puis on copie dans les autres profils.
+        face_persons = getattr(state, 'face_persons', {}) if tab == 'face' else {}
+
         for path in selected_paths:
             try:
                 rel_path = os.path.relpath(path, base_dir)
@@ -5869,51 +6607,83 @@ def index_page():
                 elif tab == 'aes': prefix = f"{next((a for a, p, m in state.aesthetic_results if p == path), 0):05.2f}_"
                 elif tab == 'nsfw': prefix = f"{next((d for d, p, l, dt in state.nsfw_results if p == path), 0)*100:05.1f}_"
                 elif tab == 'face': prefix = f"{next((s for s, p in state.face_results if p == path), 0)*100:05.1f}_"
-                    
-            dest = os.path.join(folder, rel_dir, prefix + fname)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            
-            # Skip if src and dest are the same file (prevents parasitic rename)
-            if os.path.normcase(os.path.normpath(path)) == os.path.normcase(os.path.normpath(dest)):
-                success += 1
-                continue
+
+            # ----- Calcul des destinations (1 ou plusieurs pour le tab face) -----
+            destinations = []  # liste de (dest_path, profile_name|None)
+            if tab == 'face':
+                persons = face_persons.get(path, []) or []
+                # Aggreg par profil (garder max conf, profil unique)
+                profile_confs = {}
+                for pp in persons:
+                    name = pp.get('profile') or ''
+                    conf = float(pp.get('confidence', 0.0) or 0.0)
+                    if not name:
+                        continue
+                    if name not in profile_confs or conf > profile_confs[name]:
+                        profile_confs[name] = conf
+                if profile_confs:
+                    # Trie par confiance décroissante (le 1er sera la cible du move)
+                    sorted_profiles = sorted(profile_confs.items(), key=lambda x: x[1], reverse=True)
+                    for pname, _conf in sorted_profiles:
+                        dest = os.path.join(folder, pname, rel_dir, prefix + fname)
+                        destinations.append((dest, pname))
+                else:
+                    # Pas de profil détecté : tomber dans un dossier "_unknown"
+                    dest = os.path.join(folder, '_unknown', rel_dir, prefix + fname)
+                    destinations.append((dest, None))
+            else:
+                dest = os.path.join(folder, rel_dir, prefix + fname)
+                destinations.append((dest, None))
 
             try:
-                if action == 'copy': shutil.copy2(path, dest)
-                else: 
-                    shutil.move(path, dest)
-                    moved_paths.add(path)
+                primary_done = False
+                for di, (dest, _pname) in enumerate(destinations):
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    # Skip si src == dst
+                    if os.path.normcase(os.path.normpath(path)) == os.path.normcase(os.path.normpath(dest)):
+                        continue
+                    # Pour le tab face en mode move : déplacer 1ère cible, copier les autres
+                    effective_action = action
+                    if tab == 'face' and action == 'move' and len(destinations) > 1 and di > 0:
+                        effective_action = 'copy'
+                    if effective_action == 'copy':
+                        shutil.copy2(path, dest)
+                    else:
+                        shutil.move(path, dest)
+                        moved_paths.add(path)
+                    primary_done = True
 
-                # Déplacer/copier les fichiers compagnons (_validation.json, _aesthetic.json, _tags.json, _tags.txt, _prompt.txt, .txt tags, .json méta, .ia détection IA)
-                src_stem = os.path.splitext(path)[0]
-                dest_stem = os.path.splitext(dest)[0]
-                for companion_suffix in ('_validation.json', '_aesthetic.json', '_tags.json', '_tags.txt', '_prompt.txt', '.txt', '.json', '.ia'):
-                    companion_src = src_stem + companion_suffix
-                    if os.path.isfile(companion_src):
-                        companion_dst = dest_stem + companion_suffix
-                        # Skip if companion src == dst
-                        if os.path.normcase(os.path.normpath(companion_src)) == os.path.normcase(os.path.normpath(companion_dst)):
-                            continue
-                        try:
-                            if action == 'copy':
-                                shutil.copy2(companion_src, companion_dst)
-                            else:
-                                shutil.move(companion_src, companion_dst)
-                        except Exception as ec:
-                            state.add_log(f"⚠️ Compagnon non transféré {os.path.basename(companion_src)} : {ec}")
-                
+                    # Compagnons sidecars
+                    src_stem = os.path.splitext(path)[0]
+                    dest_stem = os.path.splitext(dest)[0]
+                    for companion_suffix in ('_validation.json', '_aesthetic.json', '_tags.json', '_tags.txt', '_prompt.txt', '_persons.json', '.txt', '.json', '.ia'):
+                        companion_src = src_stem + companion_suffix
+                        if os.path.isfile(companion_src):
+                            companion_dst = dest_stem + companion_suffix
+                            if os.path.normcase(os.path.normpath(companion_src)) == os.path.normcase(os.path.normpath(companion_dst)):
+                                continue
+                            try:
+                                if effective_action == 'copy':
+                                    shutil.copy2(companion_src, companion_dst)
+                                else:
+                                    shutil.move(companion_src, companion_dst)
+                            except Exception as ec:
+                                state.add_log(f"⚠️ Compagnon non transféré {os.path.basename(companion_src)} : {ec}")
+
                 # Экспорт txt тегов (только для вкладки Tags)
                 if export_txt and tab == 'tags':
-                    txt_dest = os.path.splitext(dest)[0] + '.txt'
-                    # Достаем теги прямо из результатов
-                    item_data = next((i for i in state.tags_results if i[1] == path), None)
-                    if item_data and len(item_data) > 2:
-                        tags_dict = item_data[2]
-                        valid_tags =[t for t, s in tags_dict.items() if s >= txt_threshold]
-                        if valid_tags:
-                            with open(txt_dest, 'w', encoding='utf-8') as f:
-                                f.write(", ".join(valid_tags))
-                success += 1
+                    primary_dest = destinations[0][0] if destinations else None
+                    if primary_dest:
+                        txt_dest = os.path.splitext(primary_dest)[0] + '.txt'
+                        item_data = next((i for i in state.tags_results if i[1] == path), None)
+                        if item_data and len(item_data) > 2:
+                            tags_dict = item_data[2]
+                            valid_tags =[t for t, s in tags_dict.items() if s >= txt_threshold]
+                            if valid_tags:
+                                with open(txt_dest, 'w', encoding='utf-8') as f:
+                                    f.write(", ".join(valid_tags))
+                if primary_done:
+                    success += 1
             except Exception as e: state.add_log(f"Erreur {path} : {e}")
                 
         ui.notify(f'{success} fichiers traités avec succès ({action})', type='positive')
@@ -5942,7 +6712,7 @@ def index_page():
                         deleted_set.add(path)
                         # Supprimer les fichiers compagnons (.txt tags, .json méta, _validation.json NSFW, _aesthetic.json esthétique, _tags.json/_tags.txt tags auto, _prompt.txt prompt, .ia détection IA)
                         stem = os.path.splitext(path)[0]
-                        for companion_suffix in ('_validation.json', '_aesthetic.json', '_tags.json', '_tags.txt', '_prompt.txt', '.txt', '.json', '.ia'):
+                        for companion_suffix in ('_validation.json', '_aesthetic.json', '_tags.json', '_tags.txt', '_prompt.txt', '_persons.json', '.txt', '.json', '.ia'):
                             companion = stem + companion_suffix
                             if os.path.isfile(companion):
                                 try:
@@ -6242,6 +7012,8 @@ def index_page():
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                 ui.checkbox().bind_value(state.sel_search, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'search'), ['shiftKey'])
                             _emit_ia_badge_overlay(path, position_classes='top-2 right-2')
+                            _emit_nsfw_badge_overlay(path, position_classes='top-9 right-2')
+                            _emit_metadata_chips(path)
 
                             with ui.context_menu():
                                 ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
@@ -6393,6 +7165,7 @@ def index_page():
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-1 right-1 text-[8px] font-bold px-1 rounded border {cls} z-10')
                                 _emit_ia_badge_overlay(path, position_classes='top-6 right-1', size_classes='text-[8px] px-1')
+                                _emit_metadata_chips(path, compact=True)
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -6416,6 +7189,7 @@ def index_page():
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded border {cls} z-10')
                                 _emit_ia_badge_overlay(path, position_classes='top-8 right-2')
+                                _emit_metadata_chips(path)
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -6664,6 +7438,7 @@ def index_page():
                                 with ui.row().classes('absolute top-1 left-1 bg-black/70 rounded px-0.5 z-10'):
                                     ui.checkbox().bind_value(state.sel_nsfw, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'nsfw'), ['shiftKey']).props('dense size=xs')
                                 _emit_ia_badge_overlay(path, position_classes='top-1 right-1', size_classes='text-[8px] px-1')
+                                _emit_metadata_chips(path, compact=True)
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -6683,6 +7458,7 @@ def index_page():
                                 with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                     ui.checkbox().bind_value(state.sel_nsfw, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'nsfw'), ['shiftKey'])
                                 _emit_ia_badge_overlay(path, position_classes='top-2 right-2')
+                                _emit_metadata_chips(path)
 
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
@@ -6723,17 +7499,71 @@ def index_page():
 
     @ui.refreshable
     def face_gallery_ui():
-        if not state.face_results:
+        has_any = bool(state.face_results) or (state.face_show_undetected and bool(state.face_undetected_paths))
+        if not has_any:
             return ui.label("Les photos contenant le visage recherché apparaîtront ici...").classes("text-gray-400 m-4")
 
-        filtered_results = []
-        for item in state.face_results:
-            p = item[1].lower()
-            if state.face_res_filter == 'Images' and not p.endswith(SUPPORTED_IMAGES): continue
-            if state.face_res_filter == 'Vidéos' and not p.endswith(SUPPORTED_VIDEOS): continue
-            filtered_results.append(item)
+        profile_filter = getattr(state, 'face_profile_filter', 'Tout') or 'Tout'
+        search_q = str(state.face_search or '').strip().lower()
+        nsfw_f = state.face_nsfw_filter or 'Tout'
 
-        total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        # Construit la liste unifiée : (sim_score, path, has_detection)
+        unified = []
+        seen = set()
+        for sim_score, path in state.face_results:
+            unified.append((sim_score, path, True))
+            seen.add(path)
+        if state.face_show_undetected:
+            for path in state.face_undetected_paths:
+                if path not in seen:
+                    unified.append((0.0, path, False))
+                    seen.add(path)
+
+        filtered_results = []
+        for sim_score, path, has_det in unified:
+            p_lower = path.lower()
+            if state.face_res_filter == 'Images' and not p_lower.endswith(SUPPORTED_IMAGES): continue
+            if state.face_res_filter == 'Vidéos' and not p_lower.endswith(SUPPORTED_VIDEOS): continue
+            # Filtre profil
+            if profile_filter != 'Tout':
+                if profile_filter == '(non détecté)':
+                    if has_det:
+                        continue
+                else:
+                    persons = state.face_persons.get(path, [])
+                    if not any((pp.get('profile') == profile_filter) for pp in persons):
+                        continue
+            # Filtre NSFW
+            if nsfw_f != 'Tout':
+                tier = _read_nsfw_tier(path)
+                if nsfw_f == 'Non validé':
+                    if tier:
+                        continue
+                else:
+                    if not tier or not tier.upper().startswith(str(nsfw_f).upper()[:6]):
+                        continue
+            # Recherche par nom
+            if search_q and search_q not in os.path.basename(path).lower():
+                continue
+            filtered_results.append((sim_score, path, has_det))
+
+        # Tri
+        srt = state.face_sort or 'score'
+        if srt == 'score':
+            filtered_results.sort(key=lambda x: x[0], reverse=True)
+        elif srt == 'name_asc':
+            filtered_results.sort(key=lambda x: os.path.basename(x[1]).lower())
+        elif srt == 'name_desc':
+            filtered_results.sort(key=lambda x: os.path.basename(x[1]).lower(), reverse=True)
+        elif srt == 'profile':
+            def _profile_key(t):
+                persons = _read_persons(t[1])
+                first = persons[0][0] if persons else '~'  # ~ trie en fin
+                return (first.lower(), -t[0])
+            filtered_results.sort(key=_profile_key)
+
+        per_page = int(state.face_per_page or 40)
+        total_pages = max(1, (len(filtered_results) + per_page - 1) // per_page)
         if state.face_page > total_pages: state.face_page = 1
 
         def change_page(d):
@@ -6745,67 +7575,245 @@ def index_page():
             state.face_page = 1
             face_gallery_ui.refresh()
 
-        _s_start = (state.face_page - 1) * ITEMS_PER_PAGE
-        _page_paths_face = [item[1] for item in filtered_results[_s_start:_s_start + ITEMS_PER_PAGE]]
+        def apply_search(e):
+            state.face_search = str(e.value or '')
+            state.face_page = 1
+            face_gallery_ui.refresh()
+
+        def apply_sort(e):
+            state.face_sort = str(e.value or 'score')
+            state.face_page = 1
+            face_gallery_ui.refresh()
+
+        def apply_per_page(e):
+            state.face_per_page = int(e.value or 40)
+            state.face_page = 1
+            face_gallery_ui.refresh()
+
+        def apply_nsfw_filter(e):
+            state.face_nsfw_filter = str(e.value or 'Tout')
+            state.face_page = 1
+            face_gallery_ui.refresh()
+
+        def apply_profile_filter(e):
+            new_v = str(e.value or 'Tout')
+            if new_v == (state.face_profile_filter or 'Tout'):
+                return  # évite refresh spurious après recreation du select
+            state.face_profile_filter = new_v
+            state.face_page = 1
+            face_gallery_ui.refresh()
+
+        compact = bool(state.face_compact)
+
+        # Construit la liste des profils disponibles à partir des résultats
+        profile_options = ['Tout']
+        try:
+            seen_p = set()
+            for _s, p, _hd in unified:
+                for pp in state.face_persons.get(p, []):
+                    n = pp.get('profile') or ''
+                    if n and n not in seen_p:
+                        seen_p.add(n)
+                        profile_options.append(n)
+            if state.face_show_undetected:
+                profile_options.append('(non détecté)')
+        except Exception:
+            pass
+        if profile_filter not in profile_options:
+            profile_filter = 'Tout'
+            state.face_profile_filter = 'Tout'
+        # Dict explicite (clé=valeur=label) pour éviter qu'un changement d'ordre
+        # de la liste ne déclenche un on_change parasite après refresh.
+        profile_opts_dict = {opt: opt for opt in profile_options}
+
+        _s_start = (state.face_page - 1) * per_page
+        _page_paths_face = [it[1] for it in filtered_results[_s_start:_s_start + per_page]]
+
+        # ----- Modal Modifier profil (bulk) -----
+        def open_bulk_face_modify_dialog():
+            selected_paths = [p for p, checked in (state.sel_face or {}).items() if checked]
+            if not selected_paths:
+                ui.notify('Sélectionnez au moins un média.', type='warning')
+                return
+            available_profiles = profile_manager.list_profiles() or []
+            options = ['(retirer toute détection)'] + available_profiles
+            with ui.dialog() as dlg, ui.card().classes('bg-gray-900 text-white w-[480px] max-w-[95vw]'):
+                ui.label('Modifier profils (lot)').classes('text-lg font-bold mb-2')
+                ui.label(f'{len(selected_paths)} média sélectionné(s)').classes('text-sm text-gray-400 mb-3')
+                if not available_profiles:
+                    ui.label("Aucun profil disponible. Créez d'abord un profil dans le panneau de gauche.").classes('text-yellow-400 text-sm')
+                new_profile_sel = ui.select(options, value=options[0], label='Nouveau profil').classes('w-full')
+                conf_input = ui.number('Confiance attribuée (0.0 - 1.0)', value=1.0, format='%.2f', step=0.05).classes('w-full')
+
+                def apply_action():
+                    target = new_profile_sel.value or options[0]
+                    conf = float(conf_input.value or 1.0)
+                    conf = max(0.0, min(1.0, conf))
+                    updated = 0
+                    errors = 0
+                    for p in selected_paths:
+                        try:
+                            if target == '(retirer toute détection)':
+                                # Vide les détections
+                                state.face_persons[p] = []
+                                # Ré-écrit le sidecar avec liste vide
+                                write_persons_sidecar(p, [], float(face_threshold.value))
+                                # Retire des résultats (passe en "non détecté")
+                                state.face_results = [it for it in state.face_results if it[1] != p]
+                                if p not in state.face_undetected_paths:
+                                    state.face_undetected_paths.append(p)
+                            else:
+                                persons = [{
+                                    'profile': target,
+                                    'confidence': conf,
+                                    'bbox': None,
+                                    'manual': True,
+                                }]
+                                state.face_persons[p] = persons
+                                write_persons_sidecar(p, persons, float(face_threshold.value))
+                                # Retire des undetected si présent et l'ajoute aux résultats
+                                if p in state.face_undetected_paths:
+                                    state.face_undetected_paths.remove(p)
+                                # Met à jour ou ajoute dans face_results
+                                replaced = False
+                                for i, (s, q) in enumerate(state.face_results):
+                                    if q == p:
+                                        state.face_results[i] = (conf, p)
+                                        replaced = True
+                                        break
+                                if not replaced:
+                                    state.face_results.append((conf, p))
+                                    state.sel_face[p] = False
+                            _invalidate_persons_cache(p)
+                            updated += 1
+                        except Exception as e:
+                            errors += 1
+                            state.add_log(f"[FACE/manual] {p}: {e}")
+                    if updated:
+                        # Désélectionne après application
+                        for p in selected_paths:
+                            state.sel_face[p] = False
+                        ui.notify(f"{updated} mise(s) à jour" + (f" | erreurs: {errors}" if errors else ''),
+                                  type='positive' if errors == 0 else 'warning')
+                        dlg.close()
+                        face_gallery_ui.refresh()
+                    else:
+                        ui.notify("Aucune mise à jour effectuée.", type='negative')
+
+                with ui.row().classes('w-full gap-2 mt-4'):
+                    ui.button('Valider', on_click=apply_action).classes('flex-1 bg-teal-700 hover:bg-teal-600')
+                    ui.button('Annuler', on_click=lambda: dlg.close()).classes('flex-1 bg-gray-700 hover:bg-gray-600')
+            dlg.open()
 
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
-            with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
-                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
+            with ui.column().classes('w-full shrink-0 bg-gray-900 p-3 pb-2 border-b border-gray-800 z-20 gap-2 shadow-md'):
+                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg'):
                     with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Tout sélectionner', on_click=lambda: set_all('face', True)).props('outline color=white dense')
                         ui.button('Tout désélectionner', on_click=lambda: set_all('face', False)).props('outline color=white dense')
                         ui.button('Sél. page', on_click=lambda pp=_page_paths_face: set_page_items('face', True, pp)).props('outline color=cyan dense')
                         ui.button('Désél. page', on_click=lambda pp=_page_paths_face: set_page_items('face', False, pp)).props('outline color=cyan dense')
                         ui.toggle(['Tout', 'Images', 'Vidéos'], value=state.face_res_filter, on_change=apply_filter).classes('text-xs ml-2')
-                    with ui.row().classes('gap-2 items-center'):
+                        def toggle_show_undetected(e):
+                            state.face_show_undetected = bool(e.value)
+                            state.face_page = 1
+                            face_gallery_ui.refresh()
+                        ui.checkbox('Afficher non-détectés', value=state.face_show_undetected, on_change=toggle_show_undetected).classes('text-xs text-amber-300 ml-2')
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Export HTML', icon='html', on_click=lambda: export_html_action('face')).props('color=purple dense outline')
+                        ui.button('👤 Modifier profil', icon='edit', on_click=open_bulk_face_modify_dialog).props('color=cyan dense outline').tooltip('Assigner manuellement un profil aux médias sélectionnés')
                         ui.button('Copier ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'face', chk_prefix_face.value)).props('color=teal-800 dense')
                         ui.button('Déplacer ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'face', chk_prefix_face.value)).props('color=red dense')
                         ui.button('Supprimer ✔', icon='delete', on_click=lambda: delete_selected_media('face')).props('color=red dense outline')
 
+                with ui.row().classes('w-full items-center gap-2 flex-wrap'):
+                    ui.input(placeholder='🔍 Rechercher nom...', value=state.face_search, on_change=apply_search).props('dense outlined clearable').classes('flex-1 min-w-[160px] bg-gray-800 rounded')
+                    ui.select({'score': '↓ Score', 'name_asc': 'A→Z', 'name_desc': 'Z→A', 'profile': '👤 Profil'}, value=state.face_sort, label='Tri', on_change=apply_sort).props('dense outlined').classes('w-32')
+                    ui.select(profile_opts_dict, value=profile_filter, label='Profil', on_change=apply_profile_filter).props('dense outlined').classes('w-36')
+                    ui.select({'Tout': 'NSFW: Tout', 'Sain': '🟢 Sain', 'Sensuel': '🟡 Sensuel', 'Explicit': '🔴 Explicit', 'Non validé': '? Non validé'}, value=state.face_nsfw_filter, label='NSFW', on_change=apply_nsfw_filter).props('dense outlined').classes('w-36')
+                    ui.select({20: '20/page', 40: '40/page', 100: '100/page', 200: '200/page'}, value=per_page, label='Par page', on_change=apply_per_page).props('dense outlined').classes('w-28')
+                    ui.button(icon='grid_view' if not compact else 'view_module', on_click=lambda: (setattr(state, 'face_compact', not state.face_compact), face_gallery_ui.refresh())).props('flat round dense color=white').tooltip('Basculer vue compacte')
+                    ui.label(f'{len(filtered_results)} résultat(s)').classes('text-xs text-gray-400 ml-1')
+
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='first_page', on_click=lambda: change_page(-total_pages)).props('flat outline color=white').tooltip('Première page')
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
-                    ui.label(f'Page {state.face_page} / {total_pages}').classes('text-gray-300 font-bold')
+                    ui.label(f'Page {state.face_page} / {total_pages} ({len(filtered_results)} items)').classes('text-gray-300 font-bold text-sm')
                     ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
                     ui.button(icon='last_page', on_click=lambda: change_page(total_pages)).props('flat outline color=white').tooltip('Dernière page')
 
             scroll_id = 'face_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
-                start_idx = (state.face_page - 1) * ITEMS_PER_PAGE
-                page_items = filtered_results[start_idx : start_idx + ITEMS_PER_PAGE]
-                all_paths =[p for s, p in filtered_results]
+                start_idx = (state.face_page - 1) * per_page
+                page_items = filtered_results[start_idx : start_idx + per_page]
+                all_paths = [p for s, p, hd in filtered_results]
 
                 if not page_items:
                     ui.label("Aucun fichier pour le filtre sélectionné.").classes("text-gray-400 m-4")
 
-                with ui.grid(columns=int(state.grid_columns)).classes('w-full gap-6 pb-10'):
-                    for sim_score, path in page_items:
+                cols = int(state.grid_columns) + (3 if compact else 0)
+                gap_cls = 'w-full gap-1 pb-10' if compact else 'w-full gap-6 pb-10'
+                with ui.grid(columns=cols).classes(gap_cls):
+                    for sim_score, path, has_det in page_items:
                         safe_path = urllib.parse.quote(path)
                         global_index = all_paths.index(path)
-                        
-                        with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-teal-500 transition-colors p-0 overflow-hidden relative'):
-                            with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                ui.checkbox().bind_value(state.sel_face, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'face'), ['shiftKey'])
-                            _emit_ia_badge_overlay(path, position_classes='top-2 right-2')
+                        card_bdr = 'border-2 border-amber-700' if not has_det else 'border border-gray-700'
 
-                            with ui.context_menu():
-                                ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
-                                ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
-                                ui.menu_item('Ouvrir le dossier', on_click=lambda p=path: reveal_file_native(p))
-                                ui.menu_item('Voir tous les EXIF…', on_click=lambda p=path: show_exif_dialog(p))
-                                ui.menu_item('Copier les EXIF', on_click=lambda p=path: copy_exif_text(p))
-                                ui.separator()
-                                ui.menu_item('Copier vers…', on_click=lambda p=path: copy_file_to_action(p))
-                                ui.menu_item('Déplacer vers…', on_click=lambda p=path: move_file_to_action(p))
-                                ui.menu_item('Supprimer…', on_click=lambda p=path: delete_file_action(p))
+                        if compact:
+                            with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-teal-500 transition-colors p-0 overflow-hidden relative'):
+                                with ui.row().classes('absolute top-1 left-1 bg-black/70 rounded px-0.5 z-10'):
+                                    ui.checkbox().bind_value(state.sel_face, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'face'), ['shiftKey']).props('dense size=xs')
+                                _emit_ia_badge_overlay(path, position_classes='top-1 right-1', size_classes='text-[8px] px-1')
+                                _emit_nsfw_badge_overlay(path, position_classes='top-6 right-1', size_classes='text-[8px] px-1')
+                                _emit_metadata_chips(path, compact=True)
 
-                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
-                            
-                            with ui.row().classes('w-full justify-between items-center p-2 bg-gray-800'):
-                                ui.label(f"Similarité : {sim_score*100:.1f}%").classes('text-teal-400 font-bold text-sm')
-                                ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white')
-                            ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
+                                with ui.context_menu():
+                                    ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
+                                    ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                    ui.menu_item('Ouvrir le dossier', on_click=lambda p=path: reveal_file_native(p))
+                                    ui.menu_item('Voir tous les EXIF…', on_click=lambda p=path: show_exif_dialog(p))
+                                    ui.menu_item('Copier les EXIF', on_click=lambda p=path: copy_exif_text(p))
+                                    ui.separator()
+                                    ui.menu_item('Copier vers…', on_click=lambda p=path: copy_file_to_action(p))
+                                    ui.menu_item('Déplacer vers…', on_click=lambda p=path: move_file_to_action(p))
+                                    ui.menu_item('Supprimer…', on_click=lambda p=path: delete_file_action(p))
+
+                                ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                                with ui.row().classes('w-full items-center justify-between px-1 pb-0.5 gap-1'):
+                                    if has_det:
+                                        ui.label(f"{sim_score*100:.0f}%").classes('text-teal-400 text-[9px] font-bold truncate flex-1')
+                                    else:
+                                        ui.label('? non détecté').classes('text-amber-400 text-[9px] font-bold truncate flex-1')
+                                    ui.label(os.path.basename(path)).classes('text-[9px] text-gray-400 truncate flex-1').tooltip(path)
+                        else:
+                            with ui.card().classes(f'bg-gray-800 {card_bdr} hover:border-teal-500 transition-colors p-0 overflow-hidden relative'):
+                                with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                    ui.checkbox().bind_value(state.sel_face, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'face'), ['shiftKey'])
+                                _emit_ia_badge_overlay(path, position_classes='top-2 right-2')
+                                _emit_nsfw_badge_overlay(path, position_classes='top-9 right-2')
+                                _emit_metadata_chips(path)
+
+                                with ui.context_menu():
+                                    ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
+                                    ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                    ui.menu_item('Ouvrir le dossier', on_click=lambda p=path: reveal_file_native(p))
+                                    ui.menu_item('Voir tous les EXIF…', on_click=lambda p=path: show_exif_dialog(p))
+                                    ui.menu_item('Copier les EXIF', on_click=lambda p=path: copy_exif_text(p))
+                                    ui.separator()
+                                    ui.menu_item('Copier vers…', on_click=lambda p=path: copy_file_to_action(p))
+                                    ui.menu_item('Déplacer vers…', on_click=lambda p=path: move_file_to_action(p))
+                                    ui.menu_item('Supprimer…', on_click=lambda p=path: delete_file_action(p))
+
+                                ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+
+                                with ui.row().classes('w-full justify-between items-center p-2 bg-gray-800'):
+                                    if has_det:
+                                        ui.label(f"Similarité : {sim_score*100:.1f}%").classes('text-teal-400 font-bold text-sm')
+                                    else:
+                                        ui.label("? Non détecté").classes('text-amber-400 font-bold text-sm')
+                                    ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white')
+
+                                ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
 
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=teal-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Haut de page')
 
@@ -6927,6 +7935,261 @@ def index_page():
             return
         text, cls = _IA_OVERLAY_BADGES[v]
         ui.label(text).classes(f'absolute {position_classes} {size_classes} font-bold rounded border {cls} z-10')
+
+    # --- HELPER : badge NSFW (overlay flottant, lisible sur toutes les galeries) ---
+    def _emit_nsfw_badge_overlay(path: str, position_classes: str = 'top-2 right-12', size_classes: str = 'text-[9px] px-1.5 py-0.5'):
+        """Emet un badge NSFW flottant si un tier est connu."""
+        try:
+            tier = _read_nsfw_tier(path)
+        except Exception:
+            tier = ''
+        if not tier:
+            return
+        label, cls = _NSFW_BADGE.get(tier, _NSFW_BADGE[''])
+        ui.label(label).classes(f'absolute {position_classes} {size_classes} font-bold rounded border {cls} z-10')
+
+    # --- HELPER : badges PERSONNES détectées (overlay flottant) ---
+    _persons_cache: dict = {}
+
+    def _read_persons(path: str):
+        """Lit `{stem}_persons.json` et retourne [(profile, max_conf), ...] décroissant."""
+        if path in _persons_cache:
+            return _persons_cache[path]
+        out = []
+        try:
+            stem = os.path.splitext(path)[0]
+            sidecar = stem + '_persons.json'
+            if os.path.isfile(sidecar):
+                with open(sidecar, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                agg = {}
+                for d in (data.get('detected') or []):
+                    name = str(d.get('profile') or '').strip()
+                    if not name:
+                        continue
+                    conf = float(d.get('confidence', 0.0) or 0.0)
+                    if name not in agg or conf > agg[name]:
+                        agg[name] = conf
+                out = sorted(agg.items(), key=lambda x: x[1], reverse=True)
+        except Exception:
+            out = []
+        _persons_cache[path] = out
+        return out
+
+    def _invalidate_persons_cache(path: str | None = None):
+        if path is None:
+            _persons_cache.clear()
+        else:
+            _persons_cache.pop(path, None)
+
+    def _emit_persons_overlay(path: str, position_classes: str = 'bottom-2 left-2', max_chips: int = 3):
+        """Emet une pile de chips (1 par profil détecté) si `_persons.json` existe.
+
+        Par défaut placé en bas à gauche pour ne pas masquer le contenu de l'image.
+        """
+        persons = _read_persons(path)
+        if not persons:
+            return
+        with ui.column().classes(f'absolute {position_classes} gap-0.5 z-10 items-start').style('max-width: 88%; pointer-events: none;'):
+            for name, conf in persons[:max_chips]:
+                with ui.row().classes('bg-teal-700/95 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full shadow gap-1 items-center flex-nowrap').style('pointer-events: auto;'):
+                    ui.icon('person').classes('text-[12px]')
+                    ui.label(f"{name} · {conf*100:.0f}%").classes('truncate')
+            if len(persons) > max_chips:
+                ui.label(f"+{len(persons) - max_chips}").classes('bg-teal-900/95 text-teal-100 text-[9px] font-bold px-1.5 py-0.5 rounded-full shadow')
+
+    # --- HELPER : badges PROMPT / TAGS (overlay flottant, info-bulle au survol) ---
+    _prompt_tags_cache: dict = {}
+
+    def _detect_prompt_tags(path: str):
+        """Retourne (prompt_text|None, tags_list|None) depuis les sidecars.
+
+        Conventions reconnues :
+        - Prompt : `{stem}_prompt.txt` (prioritaire) puis `{stem}.txt`
+        - Tags   : `{stem}_tags.json` (prioritaire) puis `{stem}_tags.txt`
+        """
+        if path in _prompt_tags_cache:
+            return _prompt_tags_cache[path]
+        prompt_text = None
+        tags_list = None
+        try:
+            stem = os.path.splitext(path)[0]
+            for cand in (stem + '_prompt.txt', stem + '.txt'):
+                if os.path.isfile(cand):
+                    try:
+                        with open(cand, 'r', encoding='utf-8') as f:
+                            t = f.read().strip()
+                        if t:
+                            prompt_text = t
+                            break
+                    except Exception:
+                        pass
+            jpath = stem + '_tags.json'
+            tpath = stem + '_tags.txt'
+            if os.path.isfile(jpath):
+                try:
+                    with open(jpath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        # Schéma organizador : { schema, source_file, ..., tags: {...} }
+                        if 'tags' in data and isinstance(data['tags'], (dict, list)):
+                            inner = data['tags']
+                            tags_list = list(inner.keys()) if isinstance(inner, dict) else [str(x) for x in inner]
+                        else:
+                            tags_list = list(data.keys())
+                    elif isinstance(data, list):
+                        tags_list = [str(x) for x in data]
+                except Exception:
+                    pass
+            if not tags_list and os.path.isfile(tpath):
+                try:
+                    with open(tpath, 'r', encoding='utf-8') as f:
+                        raw = f.read().strip()
+                    if raw:
+                        # support "tag1, tag2" ou "tag1\ntag2"
+                        sep = ',' if ',' in raw else '\n'
+                        tags_list = [s.strip() for s in raw.split(sep) if s.strip()]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        result = (prompt_text, tags_list)
+        _prompt_tags_cache[path] = result
+        return result
+
+    def _invalidate_prompt_tags_cache(path: str | None = None):
+        if path is None:
+            _prompt_tags_cache.clear()
+        else:
+            _prompt_tags_cache.pop(path, None)
+
+    def _emit_prompt_tags_overlay(path: str, position_classes: str = 'bottom-2 right-2', compact: bool = False):
+        """Emet 0/1/2 badges (📝 prompt, 🏷️ tags) si les sidecars existent.
+
+        Survol = info-bulle avec extrait. Click = ouvre dialog avec contenu complet.
+        """
+        prompt_text, tags_list = _detect_prompt_tags(path)
+        if not prompt_text and not tags_list:
+            return
+        size = 'text-[9px] px-1.5 py-0.5' if not compact else 'text-[8px] px-1 py-0.5'
+
+        with ui.row().classes(f'absolute {position_classes} gap-1 z-10 items-center').style('pointer-events: auto;'):
+            if prompt_text:
+                snippet = (prompt_text[:120] + '…') if len(prompt_text) > 120 else prompt_text
+                lbl = ui.label('📝').classes(f'bg-indigo-700/95 text-white {size} font-bold rounded shadow cursor-pointer')
+                lbl.tooltip(snippet)
+                lbl.on('click', lambda p=path, pt=prompt_text, tl=tags_list: _open_prompt_tags_dialog(p, pt, tl))
+            if tags_list:
+                snippet = ', '.join(str(t) for t in tags_list[:12])
+                if len(tags_list) > 12:
+                    snippet += f' (+{len(tags_list)-12})'
+                lbl = ui.label(f'🏷️{len(tags_list)}').classes(f'bg-amber-700/95 text-white {size} font-bold rounded shadow cursor-pointer')
+                lbl.tooltip(snippet)
+                lbl.on('click', lambda p=path, pt=prompt_text, tl=tags_list: _open_prompt_tags_dialog(p, pt, tl))
+
+    # --- HELPER : dialog partagé pour prompt + tags (copie au presse-papier) ---
+    def _open_prompt_tags_dialog(path: str, prompt_text, tags_list):
+        with ui.dialog() as dlg, ui.card().classes('bg-gray-900 text-white w-[640px] max-w-[95vw] max-h-[80vh] overflow-y-auto'):
+            ui.label(os.path.basename(path)).classes('text-sm text-gray-400 mb-2 truncate')
+            if prompt_text:
+                with ui.row().classes('w-full items-center justify-between mt-2'):
+                    ui.label('📝 Prompt').classes('text-base font-bold text-indigo-300')
+                    def _copy_prompt():
+                        payload = json.dumps(prompt_text)
+                        ui.run_javascript(f'navigator.clipboard.writeText({payload})')
+                        ui.notify('Prompt copié dans le presse-papier', type='positive')
+                    ui.button('📋 Copier', on_click=_copy_prompt).props('dense color=indigo-700').classes('text-xs')
+                ta = ui.textarea(value=prompt_text).props('outlined autogrow').classes('w-full bg-gray-800 text-xs select-all')
+                ta.props('input-style="user-select:text;-webkit-user-select:text;"')
+            if tags_list:
+                with ui.row().classes('w-full items-center justify-between mt-3'):
+                    ui.label(f'🏷️ Tags ({len(tags_list)})').classes('text-base font-bold text-amber-300')
+                    def _copy_tags():
+                        payload = json.dumps(', '.join(str(t) for t in tags_list))
+                        ui.run_javascript(f'navigator.clipboard.writeText({payload})')
+                        ui.notify(f'{len(tags_list)} tag(s) copié(s)', type='positive')
+                    ui.button('📋 Copier', on_click=_copy_tags).props('dense color=amber-700').classes('text-xs')
+                with ui.row().classes('flex-wrap gap-1'):
+                    for t in tags_list[:200]:
+                        ui.label(str(t)).classes('bg-amber-800/70 text-amber-100 text-xs px-2 py-0.5 rounded-full select-text cursor-text')
+                if len(tags_list) > 200:
+                    ui.label(f'... +{len(tags_list)-200}').classes('text-xs text-gray-400')
+            ui.button('Fermer', on_click=lambda: dlg.close()).classes('mt-3 bg-gray-700 hover:bg-gray-600')
+        dlg.open()
+
+    # --- HELPER : score esthétique depuis sidecar `_aesthetic.json` ---
+    _aesthetic_cache: dict = {}
+
+    def _read_aesthetic(path: str):
+        """Retourne (avg_pct, max_pct) ou None si pas de sidecar / score=0."""
+        if path in _aesthetic_cache:
+            return _aesthetic_cache[path]
+        out = None
+        try:
+            stem = os.path.splitext(path)[0]
+            sidecar = stem + '_aesthetic.json'
+            if os.path.isfile(sidecar):
+                with open(sidecar, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                res = (data or {}).get('result', {})
+                avg = float(res.get('avg_score', 0.0) or 0.0)
+                mx = float(res.get('max_score', avg) or avg)
+                if avg > 0.0 or mx > 0.0:
+                    out = (aesthetic_score_to_percent(avg), aesthetic_score_to_percent(mx))
+        except Exception:
+            out = None
+        _aesthetic_cache[path] = out
+        return out
+
+    def _invalidate_aesthetic_cache(path: str | None = None):
+        if path is None:
+            _aesthetic_cache.clear()
+        else:
+            _aesthetic_cache.pop(path, None)
+
+    # --- HELPER : bande de chips inline (profils + prompt + tags + esthétique) ---
+    # Placée en haut de chaque carte avec un padding pour ne pas chevaucher
+    # la rangée checkbox/IA/NSFW (absolues).
+    def _emit_metadata_chips(path: str, compact: bool = False):
+        persons = _read_persons(path)
+        prompt_text, tags_list = _detect_prompt_tags(path)
+        aes = _read_aesthetic(path)
+        if not persons and not prompt_text and not tags_list and aes is None:
+            return
+        chip_size = 'text-[8px] px-1 py-0' if compact else 'text-[10px] px-1.5 py-0.5'
+        # Padding pour clear les badges absolus :
+        #   - top : checkbox (top-2, ~40px) + IA + NSFW
+        #   - left : checkbox (top-2 left-2, ~32px de large)
+        #   - right : IA + NSFW empilés (top-2 right-2, ~90px de large)
+        pt_cls = 'pt-7 pl-7 pr-16' if compact else 'pt-12 pl-10 pr-24'
+        with ui.row().classes(f'w-full {pt_cls} pb-1 gap-1 flex-wrap items-center bg-gray-900/40 z-0'):
+            for name, conf in persons[:2]:
+                with ui.row().classes(f'bg-teal-700 text-white {chip_size} font-bold rounded-full gap-0.5 items-center flex-nowrap'):
+                    ui.icon('person').classes('text-[10px]' if not compact else 'text-[8px]')
+                    ui.label(f"{name} {conf*100:.0f}%").classes('truncate').style('max-width: 80px;').tooltip(f"{name} · {conf*100:.1f}%")
+            if len(persons) > 2:
+                ui.label(f"+{len(persons)-2}").classes(f'bg-teal-900 text-teal-100 {chip_size} rounded-full font-bold').tooltip(', '.join(n for n, _ in persons[2:]))
+            if prompt_text:
+                snippet = (prompt_text[:120] + '…') if len(prompt_text) > 120 else prompt_text
+                lbl = ui.label('📝').classes(f'bg-indigo-700 text-white {chip_size} font-bold rounded shadow cursor-pointer')
+                lbl.tooltip(snippet)
+                lbl.on('click', lambda p=path, pt=prompt_text, tl=tags_list: _open_prompt_tags_dialog(p, pt, tl))
+            if tags_list:
+                tt = ', '.join(str(t) for t in tags_list[:12])
+                if len(tags_list) > 12:
+                    tt += f' (+{len(tags_list)-12})'
+                lbl = ui.label(f'🏷️{len(tags_list)}').classes(f'bg-amber-700 text-white {chip_size} font-bold rounded shadow cursor-pointer')
+                lbl.tooltip(tt)
+                lbl.on('click', lambda p=path, pt=prompt_text, tl=tags_list: _open_prompt_tags_dialog(p, pt, tl))
+            if aes is not None:
+                avg_pct, max_pct = aes
+                if avg_pct >= 70:
+                    color = 'bg-yellow-500 text-yellow-900'
+                elif avg_pct >= 50:
+                    color = 'bg-yellow-700 text-yellow-100'
+                else:
+                    color = 'bg-gray-700 text-gray-200'
+                ui.label(f'⭐ {avg_pct:.0f}%').classes(f'{color} {chip_size} font-bold rounded shadow').tooltip(f'Esthétique : avg {avg_pct:.1f}% · max {max_pct:.1f}%')
 
     # --- COMPOSANT GALERIE TAGS ---
     @ui.refreshable
@@ -7057,6 +8320,7 @@ def index_page():
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-1 right-1 text-[8px] font-bold px-1 rounded border {cls} z-10')
                                 _emit_ia_badge_overlay(path, position_classes='top-6 right-1', size_classes='text-[8px] px-1')
+                                _emit_metadata_chips(path, compact=True)
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -7077,6 +8341,7 @@ def index_page():
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded border {cls} z-10')
                                 _emit_ia_badge_overlay(path, position_classes='top-8 right-2')
+                                _emit_metadata_chips(path)
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -7237,6 +8502,7 @@ def index_page():
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-1 right-1 text-[8px] font-bold px-1 rounded border {cls} z-10')
                                 _emit_ia_badge_overlay(path, position_classes='top-6 right-1', size_classes='text-[8px] px-1')
+                                _emit_metadata_chips(path, compact=True)
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -7269,6 +8535,7 @@ def index_page():
                                     lbl, cls = _NSFW_BADGE.get(nsfw_tier, _NSFW_BADGE[''])
                                     ui.label(lbl).classes(f'absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded border {cls} z-10')
                                 _emit_ia_badge_overlay(path, position_classes='top-8 right-2')
+                                _emit_metadata_chips(path)
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -7356,6 +8623,89 @@ def index_page():
         _s_start = (state.ia_page - 1) * per_page
         _page_paths_ia = [item[1] for item in filtered[_s_start:_s_start + per_page]]
 
+        # --- Modal "Modifier statut IA" : marquage en lot, gère le cas freeze (select-all) ---
+        def open_bulk_ia_modify_dialog(prefilled_paths=None):
+            # Source des cibles : la sélection courante OU les paths préfournis OU tout le filtre courant
+            sel_paths = [p for p, v in (state.sel_ia or {}).items() if v]
+            paths_filtered = [it[1] for it in filtered]
+            with ui.dialog() as dlg, ui.card().classes('bg-gray-900 text-white w-[520px] max-w-[95vw]'):
+                ui.label('🤖 Modifier statut IA (lot)').classes('text-lg font-bold mb-2 text-pink-300')
+                # Choix de la source
+                source_options = {
+                    'sel': f'Sélection courante ({len(sel_paths)})',
+                    'filt': f'Tout le filtre courant ({len(paths_filtered)})',
+                }
+                source_value = 'sel' if sel_paths else 'filt'
+                ui.label('Cibles').classes('text-xs text-gray-400 mt-1')
+                src_sel = ui.select(source_options, value=source_value, label='Sur quoi appliquer ?').props('dense outlined').classes('w-full')
+                ui.label('Nouveau statut').classes('text-xs text-gray-400 mt-3')
+                verdict_options = {'ai': '🤖 Marquer IA', 'photo': '📷 Marquer Photo réelle', 'unknown': '❓ Effacer le verdict (Inconnu)'}
+                v_sel = ui.select(verdict_options, value='ai', label='Verdict').props('dense outlined').classes('w-full')
+                write_sc = ui.checkbox('Écrire aussi le sidecar .ia', value=True).classes('mt-2')
+
+                async def apply_action():
+                    targets = sel_paths if src_sel.value == 'sel' else paths_filtered
+                    if not targets:
+                        ui.notify('Aucune cible.', type='warning')
+                        return
+                    verdict = True if v_sel.value == 'ai' else (False if v_sel.value == 'photo' else None)
+                    label = '🤖 IA' if verdict is True else ('📷 Photo' if verdict is False else '❓ Inconnu')
+                    write_sidecar = bool(write_sc.value)
+                    dlg.close()
+                    ui.notify(f'Marquage de {len(targets)} fichier(s) en cours…', type='ongoing', timeout=2000)
+
+                    def _bg():
+                        n = 0
+                        for fp in targets:
+                            try:
+                                if verdict is None:
+                                    search_engine.db_cache.delete_ai_detection(fp)
+                                    try:
+                                        sp = os.path.splitext(fp)[0] + '.ia'
+                                        if os.path.exists(sp):
+                                            os.remove(sp)
+                                    except Exception:
+                                        pass
+                                else:
+                                    payload = {
+                                        'is_ai': bool(verdict),
+                                        'confidence': 1.0,
+                                        'method': 'manual_override',
+                                        'detected_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                                    }
+                                    search_engine.db_cache.save_ai_detection(fp, bool(verdict), 1.0, 'manual_override', payload)
+                                    if write_sidecar:
+                                        TagEngine._write_sidecar_ia(fp, payload)
+                                n += 1
+                            except Exception as ex:
+                                state.add_log(f"[IA] bulk_mark {fp}: {ex}")
+                        return n
+                    n_done = await run.io_bound(_bg)
+
+                    # Met à jour state.ia_results en place (pas de full reload qui prendrait du temps)
+                    target_set = set(targets)
+                    new_results = []
+                    for tup in state.ia_results:
+                        if tup[1] in target_set:
+                            score, path, _is, conf, method, det = tup
+                            if verdict is None:
+                                new_results.append((score, path, None, 0.0, '', None))
+                            else:
+                                new_results.append((1.0 if verdict else 0.0, path, bool(verdict), 1.0, 'manual_override',
+                                                    {'is_ai': bool(verdict), 'confidence': 1.0, 'method': 'manual_override'}))
+                        else:
+                            new_results.append(tup)
+                    state.ia_results = new_results
+                    state.ia_page = 1
+                    ia_gallery_ui.refresh()
+                    ui.notify(f'{n_done} fichier(s) → {label}', type='positive')
+                    state.add_log(f"[IA] bulk: {n_done}/{len(targets)} → {label}")
+
+                with ui.row().classes('w-full gap-2 mt-4'):
+                    ui.button('Valider', on_click=apply_action).classes('flex-1 bg-pink-700 hover:bg-pink-600')
+                    ui.button('Annuler', on_click=lambda: dlg.close()).classes('flex-1 bg-gray-700 hover:bg-gray-600')
+            dlg.open()
+
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-3 pb-2 border-b border-gray-800 z-20 gap-2 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg'):
@@ -7368,6 +8718,7 @@ def index_page():
                         ui.toggle(['Tout', 'IA', 'Photo', 'Inconnu'], value=status_filter, on_change=apply_status).classes('text-xs ml-2')
                     with ui.row().classes('gap-2 items-center flex-wrap'):
                         ui.button('Export HTML', icon='html', on_click=lambda: export_html_action('ia')).props('color=purple dense outline')
+                        ui.button('🤖 Modifier statut', icon='edit', on_click=open_bulk_ia_modify_dialog).props('color=pink dense outline').tooltip('Marquer en lot la sélection (ou tout le filtre) comme IA / Photo / Inconnu')
                         ui.button('Copier ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'ia', False, False)).props('color=teal-800 dense')
                         ui.button('Déplacer ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'ia', False, False)).props('color=red dense')
                         ui.button('Supprimer ✔', icon='delete', on_click=lambda: delete_selected_media('ia')).props('color=red dense outline')
@@ -7410,6 +8761,8 @@ def index_page():
                                 with ui.row().classes('absolute top-1 left-1 bg-black/70 rounded px-0.5 z-10'):
                                     ui.checkbox().bind_value(state.sel_ia, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'ia'), ['shiftKey']).props('dense size=xs')
                                 ui.label(badge_text).classes(f'absolute top-1 right-1 text-[9px] font-bold px-1 rounded border {badge_cls} z-10')
+                                _emit_nsfw_badge_overlay(path, position_classes='top-7 right-1', size_classes='text-[8px] px-1')
+                                _emit_metadata_chips(path, compact=True)
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -7427,6 +8780,8 @@ def index_page():
                                 with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                     ui.checkbox().bind_value(state.sel_ia, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'ia'), ['shiftKey'])
                                 ui.label(badge_text).classes(f'absolute top-2 right-2 text-[10px] font-bold px-2 py-0.5 rounded border {badge_cls} z-10')
+                                _emit_nsfw_badge_overlay(path, position_classes='top-9 right-2')
+                                _emit_metadata_chips(path)
                                 with ui.context_menu():
                                     ui.menu_item('Copier le chemin', on_click=lambda p=path: ui.clipboard.write(p))
                                     ui.menu_item('Copier l\'image', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -7921,6 +9276,13 @@ def index_page():
                         with ui.row().classes('w-full gap-2 px-2 pb-2'):
                             nsfw_max_dim = ui.number('Limite résol.', value=cfg.get('nsfw_max_dim', 512), format='%.0f').classes('w-[45%]')
                             nsfw_quant_mode = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('nsfw_quant_mode', 'None'), label='Quant.').classes('w-[45%]')
+                        with ui.row().classes('w-full gap-2 px-2 pb-2'):
+                            chk_nsfw_metadata_only_to_model = ui.checkbox(
+                                'Forcer modèle si metadata seule (pas de sidecar .txt/_prompt.txt)',
+                                value=cfg.get('chk_nsfw_metadata_only_to_model', False),
+                            ).classes('text-xs').tooltip(
+                                "Si coché, les fichiers ayant SEULEMENT un prompt en metadata embarquée (pas de sidecar .txt ni _prompt.txt) seront analysés par le modèle au lieu d'être classés par mots-clés."
+                            )
                 
                 async def run_nsfw_action():
                     state.nsfw_model = nsfw_model_sel.value
@@ -7932,7 +9294,8 @@ def index_page():
                         'top_n_nsfw': top_n_nsfw.value, 
                         'nsfw_batch_size': nsfw_batch_size.value, 'nsfw_video_frames': nsfw_video_frames.value, 
                         'nsfw_max_dim': nsfw_max_dim.value, 'nsfw_quant_mode': nsfw_quant_mode.value,
-                        'chk_prefix_nsfw': chk_prefix_nsfw.value
+                        'chk_prefix_nsfw': chk_prefix_nsfw.value,
+                        'chk_nsfw_metadata_only_to_model': chk_nsfw_metadata_only_to_model.value,
                     })
                     if not nsfw_dir.value: return ui.notify("Indiquez un dossier !", type='warning')
                     
@@ -7971,6 +9334,7 @@ def index_page():
                                 nsfw_dir.value,
                                 state.nsfw_model,
                                 tuple(exts),
+                                metadata_only_to_model=bool(chk_nsfw_metadata_only_to_model.value),
                             )
                             state.nsfw_all_results = res
 
@@ -8069,66 +9433,343 @@ def index_page():
             with ui.column().classes('w-[350px] shrink-0 bg-gray-900 rounded-xl border border-gray-800 shadow-lg flex flex-col overflow-hidden p-0 gap-0'):
                 with ui.row().classes('w-full p-4 pb-2 shrink-0 border-b border-gray-800 bg-gray-900 z-10'):
                     ui.label('Recherche par Visage').classes('text-lg font-bold')
-                
+
                 with ui.column().classes('w-full flex-1 overflow-y-auto p-4 gap-2 min-h-0'):
                     with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
                         face_dir = ui.input('Dossier de recherche', value=cfg.get('face_dir', '')).classes('flex-grow')
                         ui.button(icon='folder', on_click=lambda: select_folder(face_dir)).props('flat round dense')
                         ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache(face_dir.value)).props('flat round dense text-color=red').tooltip('Effacer l\'index du dossier')
-                        
-                    with ui.row().classes('w-full items-center gap-1 flex-nowrap mt-2'):
-                        ref_img = ui.input('Photo de référence (visage)', value=cfg.get('ref_img', '')).classes('flex-grow')
-                        ui.button(icon='image', on_click=lambda: select_file(ref_img)).props('flat round dense')
-                        
+
+                    # ----- BLOC PROFILS -----
+                    with ui.expansion('Profils de visages', icon='groups', value=True).classes('w-full bg-gray-800/50 rounded-lg border border-teal-700 mt-2'):
+                        with ui.column().classes('w-full gap-1 px-2 pt-2 pb-2'):
+                            with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
+                                profiles_dir = ui.input('Répertoire des profils', value=cfg.get('profiles_dir', '')).classes('flex-grow')
+                                ui.button(icon='folder', on_click=lambda: select_folder(profiles_dir)).props('flat round dense')
+
+                            def refresh_profiles_dropdown():
+                                profile_manager.set_profiles_dir(profiles_dir.value)
+                                names = profile_manager.list_profiles()
+                                profile_sel.options = ['(aucun)'] + names
+                                if profile_sel.value not in profile_sel.options:
+                                    profile_sel.value = '(aucun)'
+                                profile_sel.update()
+                                profile_filter_sel.options = ['Tout'] + names
+                                if profile_filter_sel.value not in profile_filter_sel.options:
+                                    profile_filter_sel.value = 'Tout'
+                                profile_filter_sel.update()
+
+                            profile_sel = ui.select(['(aucun)'], value='(aucun)', label='Profil actif (mode 1 profil)').classes('w-full text-xs')
+
+                            with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
+                                new_profile_input = ui.input('Nouveau profil', placeholder='ex: kathleen').classes('flex-grow')
+
+                                def create_profile_action():
+                                    profile_manager.set_profiles_dir(profiles_dir.value)
+                                    if not profiles_dir.value:
+                                        return ui.notify('Sélectionnez d\'abord un répertoire de profils.', type='warning')
+                                    name = (new_profile_input.value or '').strip()
+                                    if not name:
+                                        return ui.notify('Nom requis.', type='warning')
+                                    try:
+                                        safe, path = profile_manager.create_profile(name)
+                                        ui.notify(f"Profil '{safe}' créé : {path}", type='positive')
+                                        new_profile_input.value = ''
+                                        refresh_profiles_dropdown()
+                                        profile_sel.value = safe
+                                    except Exception as e:
+                                        ui.notify(f"Erreur : {e}", type='negative')
+
+                                ui.button(icon='add', on_click=create_profile_action).props('flat round dense color=teal').tooltip('Créer un nouveau profil (sous-dossier)')
+                                ui.button(icon='refresh', on_click=lambda: (refresh_profiles_dropdown(), ui.notify('Profils rechargés', type='info'))).props('flat round dense color=cyan').tooltip('Recharger la liste des profils')
+
+                            async def add_reference_photos_action():
+                                profile_manager.set_profiles_dir(profiles_dir.value)
+                                if not profiles_dir.value or not os.path.isdir(profiles_dir.value):
+                                    return ui.notify("Sélectionnez d'abord un répertoire de profils valide.", type='warning')
+                                target = (profile_sel.value or '').strip()
+                                if not target or target == '(aucun)':
+                                    return ui.notify("Sélectionnez d'abord un profil actif.", type='warning')
+                                files = await run.io_bound(pick_files_native)
+                                if not files:
+                                    return
+                                profile_dir = os.path.join(profiles_dir.value, target)
+                                os.makedirs(profile_dir, exist_ok=True)
+                                added = 0
+                                for src in files:
+                                    try:
+                                        base = os.path.basename(src)
+                                        dst = os.path.join(profile_dir, base)
+                                        # Évite collision : suffixe numérique si nécessaire
+                                        if os.path.normcase(os.path.normpath(src)) == os.path.normcase(os.path.normpath(dst)):
+                                            added += 1
+                                            continue
+                                        if os.path.exists(dst):
+                                            stem, ext = os.path.splitext(base)
+                                            n = 1
+                                            while True:
+                                                cand = os.path.join(profile_dir, f"{stem}_{n}{ext}")
+                                                if not os.path.exists(cand):
+                                                    dst = cand
+                                                    break
+                                                n += 1
+                                        shutil.copy2(src, dst)
+                                        added += 1
+                                    except Exception as e:
+                                        state.add_log(f"⚠️ Photo ref non ajoutée {src}: {e}")
+                                # Invalide le cache du profil pour forcer le recalcul
+                                try:
+                                    meta = os.path.join(profile_dir, profile_manager.META_FNAME)
+                                    emb = os.path.join(profile_dir, profile_manager.EMB_FNAME)
+                                    for f in (meta, emb):
+                                        if os.path.isfile(f):
+                                            os.remove(f)
+                                except Exception:
+                                    pass
+                                ui.notify(f"{added} photo(s) ajoutée(s) au profil '{target}'. Le centroïde sera recalculé à la prochaine recherche.", type='positive')
+
+                            with ui.row().classes('w-full items-center gap-1 flex-nowrap mt-1'):
+                                ui.button('📷 Ajouter photos de référence', on_click=add_reference_photos_action) \
+                                    .props('flat dense color=teal') \
+                                    .classes('w-full text-xs') \
+                                    .tooltip('Copier des images dans le profil sélectionné (et invalider son centroïde)')
+
+                            face_search_mode_sel = ui.toggle(
+                                {'multi': 'Tous les profils', 'single': '1 profil'},
+                                value=cfg.get('face_search_mode', 'multi'),
+                            ).classes('w-full text-xs')
+
+                            chk_force_rebuild = ui.checkbox('Recalculer centroïdes (ignorer cache profil)', value=False).classes('text-xs text-gray-400')
+
+                            ui.label('Astuce : ajoutez plusieurs photos de référence dans chaque sous-dossier de profil pour améliorer la précision (centroïde moyen).').classes('text-[10px] text-gray-500 italic')
+
                     with ui.row().classes('w-full gap-2 mt-2'):
                         chk_img_face = ui.checkbox('Images', value=cfg.get('chk_img_face', True))
                         chk_vid_face = ui.checkbox('Vidéos (1er fotogramme)', value=cfg.get('chk_vid_face', False))
-                    
+
                     face_threshold = ui.number('Similarité min. (0.0 - 1.0)', value=cfg.get('face_threshold', 0.40), format='%.2f', step=0.05).classes('w-full mt-2')
                     chk_prefix_face = ui.checkbox('Préfixer la similarité au nom (copie)', value=cfg.get('chk_prefix_face', False)).classes('text-sm text-gray-300 w-full mt-2')
+                    chk_face_write_sidecar = ui.checkbox('Écrire sidecar `_persons.json`', value=cfg.get('chk_face_write_sidecar', True)).classes('text-sm text-gray-300 w-full')
+
+                    profile_filter_sel = ui.select(['Tout'], value='Tout', label='Filtrer galerie par profil détecté') \
+                        .classes('w-full text-xs mt-2') \
+                        .bind_value(state, 'face_profile_filter') \
+                        .on('update:model-value', lambda e: face_gallery_ui.refresh())
 
                     with ui.expansion('Paramètres avancés', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
                         with ui.row().classes('w-full gap-2 px-2 pt-2 pb-2'):
                             face_batch_size = ui.number('Lot', value=cfg.get('face_batch_size', 16), format='%.0f').classes('w-[45%]')
 
+                # Initialise la liste des profils au démarrage
+                try:
+                    refresh_profiles_dropdown()
+                except Exception:
+                    pass
+
+                async def load_face_identified_action():
+                    """Charge les images du dossier de recherche qui possèdent
+                    déjà un sidecar `{stem}_persons.json`, sans relancer la
+                    détection."""
+                    if not face_dir.value or not os.path.isdir(face_dir.value):
+                        return ui.notify("Indiquez un dossier de recherche valide.", type='warning')
+
+                    exts = []
+                    if chk_img_face.value: exts.extend(SUPPORTED_IMAGES)
+                    if chk_vid_face.value: exts.extend(SUPPORTED_VIDEOS)
+                    if not exts:
+                        return ui.notify("Activez au moins Images ou Vidéos.", type='warning')
+                    exts_t = tuple(e.lower() for e in exts)
+
+                    profile_filter = None
+                    if (face_search_mode_sel.value or 'multi') == 'single':
+                        sel = profile_sel.value
+                        if sel and sel != '(aucun)':
+                            profile_filter = sel
+
+                    results = []
+                    persons_by_path = {}
+                    seen = set()
+                    state.is_processing = True
+                    state.status_text = "Chargement des sidecars _persons.json..."
+                    state.face_results.clear()
+                    state.face_persons.clear()
+                    state.face_undetected_paths = []
+                    state.sel_face.clear()
+                    state.face_page = 1
+                    state.face_base_dir = face_dir.value
+                    _invalidate_persons_cache()
+                    btn_load_face.disable(); btn_face.disable()
+                    try:
+                        for root, _dirs, files in os.walk(face_dir.value):
+                            for fn in files:
+                                if not fn.lower().endswith(exts_t):
+                                    continue
+                                full = os.path.join(root, fn)
+                                if full in seen:
+                                    continue
+                                stem = os.path.splitext(full)[0]
+                                sidecar = stem + '_persons.json'
+                                if not os.path.isfile(sidecar):
+                                    continue
+                                try:
+                                    with open(sidecar, 'r', encoding='utf-8') as f:
+                                        data = json.load(f)
+                                except Exception as e:
+                                    state.add_log(f"[FACE/load] sidecar illisible {sidecar} : {e}")
+                                    continue
+                                detected = data.get('detected') or []
+                                if not isinstance(detected, list) or not detected:
+                                    continue
+                                if profile_filter is not None:
+                                    detected = [d for d in detected if d.get('profile') == profile_filter]
+                                    if not detected:
+                                        continue
+                                persons_by_path[full] = detected
+                                # Sim score = max confidence parmi les profils détectés
+                                try:
+                                    best = max(float(d.get('confidence', 0.0) or 0.0) for d in detected)
+                                except Exception:
+                                    best = 0.0
+                                results.append((best, full))
+                                seen.add(full)
+
+                        results.sort(key=lambda x: x[0], reverse=True)
+                        state.face_results = results
+                        state.face_persons = persons_by_path
+                        state.sel_face = {p: False for _, p in results}
+
+                        # Médias scannés sans (ou avec sidecar mais aucun profil filtré) — utile pour assignation manuelle
+                        try:
+                            detected_set = set(persons_by_path.keys())
+                            undetected = []
+                            for r, _d, fs in os.walk(face_dir.value):
+                                for fn in fs:
+                                    if fn.lower().endswith(exts_t):
+                                        full = os.path.join(r, fn)
+                                        if full not in detected_set:
+                                            undetected.append(full)
+                            state.face_undetected_paths = undetected
+                        except Exception:
+                            state.face_undetected_paths = []
+                        state.add_log(f"[FACE] Chargés {len(results)} fichier(s) avec _persons.json (filtre profil: {profile_filter or 'aucun'}). Non-détectés : {len(state.face_undetected_paths)}.")
+                        ui.notify(f"{len(results)} fichier(s) chargé(s).", type='positive' if results else 'info')
+                    except Exception as e:
+                        state.add_log(f"❌ Erreur chargement identifiés : {e}")
+                        ui.notify(f"Erreur : {e}", type='negative')
+                    finally:
+                        state.is_processing = False
+                        state.status_text = "Prêt !"
+                        state.progress = 1.0
+                        try:
+                            face_gallery_ui.refresh()
+                        except Exception:
+                            pass
+                        btn_load_face.enable(); btn_face.enable()
+
                 async def run_face_action():
                     save_config({
-                        'face_dir': face_dir.value, 'ref_img': ref_img.value,
+                        'face_dir': face_dir.value,
+                        'profiles_dir': profiles_dir.value,
                         'chk_img_face': chk_img_face.value, 'chk_vid_face': chk_vid_face.value,
                         'face_threshold': face_threshold.value, 'chk_prefix_face': chk_prefix_face.value,
-                        'face_batch_size': face_batch_size.value
+                        'face_batch_size': face_batch_size.value,
+                        'face_search_mode': face_search_mode_sel.value,
+                        'chk_face_write_sidecar': chk_face_write_sidecar.value,
                     })
-                    if not face_dir.value or not ref_img.value: return ui.notify("Indiquez un dossier et une photo de référence !", type='warning')
-                    
+                    if not face_dir.value:
+                        return ui.notify("Indiquez un dossier de recherche !", type='warning')
+                    if not profiles_dir.value:
+                        return ui.notify("Indiquez un répertoire de profils !", type='warning')
+
+                    profile_manager.set_profiles_dir(profiles_dir.value)
+                    state.face_search_mode = face_search_mode_sel.value or 'multi'
+
+                    profile_names = []
+                    if state.face_search_mode == 'single':
+                        sel = profile_sel.value
+                        if not sel or sel == '(aucun)':
+                            return ui.notify("Sélectionnez un profil pour le mode 1 profil.", type='warning')
+                        profile_names = [sel]
+                        state.face_active_profile = sel
+                    else:
+                        profile_names = profile_manager.list_profiles()
+                        if not profile_names:
+                            return ui.notify("Aucun profil trouvé dans le répertoire.", type='warning')
+                        state.face_active_profile = ''
+
                     state.is_processing = True
                     search_engine.cancel_flag = False
                     state.face_results.clear()
+                    state.face_persons.clear()
+                    state.face_undetected_paths = []
                     state.sel_face.clear()
                     state.face_page = 1
                     face_gallery_ui.refresh()
                     btn_face.disable()
-                    
+
                     search_engine._unload_embedding_model()
                     aesthetic_engine.unload()
                     nsfw_engine.unload()
                     tag_engine.unload()
-                    
-                    exts =[]
+
+                    exts = []
                     if chk_img_face.value: exts.extend(SUPPORTED_IMAGES)
                     if chk_vid_face.value: exts.extend(SUPPORTED_VIDEOS)
 
                     def bg_task():
+                        bbox_by_path = {}
                         try:
-                            state.add_log(f"Démarrage de la recherche par visage : '{face_dir.value}'")
+                            state.add_log(f"Démarrage recherche visage (mode={state.face_search_mode}, profils={len(profile_names)}) : '{face_dir.value}'")
                             face_engine.batch_size = int(face_batch_size.value)
                             state.face_base_dir = face_dir.value
-                            
-                            res = face_engine.search_faces(ref_img.value, face_dir.value, tuple(exts), float(face_threshold.value))
-                                
+
+                            state.status_text = f"Construction des centroïdes ({len(profile_names)} profils)..."
+                            profiles = profile_manager.build_profiles(profile_names, force=bool(chk_force_rebuild.value))
+                            if not profiles:
+                                state.add_log("❌ Aucun profil utilisable (pas de visage détectable dans les références).")
+                                return
+
+                            res, persons_by_path, bbox_by_path = face_engine.search_faces_multi(
+                                profiles, face_dir.value, tuple(exts),
+                                float(face_threshold.value), mode=state.face_search_mode,
+                            )
                             state.face_results = res
+                            state.face_persons = persons_by_path
                             state.sel_face = {path: False for _, path in state.face_results}
-                            state.add_log("✅ Recherche par visage terminée !")
-                        except Exception as e: state.add_log(f"❌ Erreur de recherche par visage : {e}")
+
+                            # Calcule les fichiers non-détectés (parcourt le dossier, exclut les détectés)
+                            try:
+                                exts_low = tuple(e.lower() for e in exts)
+                                detected_set = {p for _, p in res}
+                                undetected = []
+                                for r, _d, fs in os.walk(face_dir.value):
+                                    for fn in fs:
+                                        if fn.lower().endswith(exts_low):
+                                            full = os.path.join(r, fn)
+                                            if full not in detected_set:
+                                                undetected.append(full)
+                                state.face_undetected_paths = undetected
+                                state.add_log(f"[FACE] Non-détectés : {len(undetected)} fichier(s).")
+                            except Exception as _eu:
+                                state.add_log(f"[FACE] Erreur calcul non-détectés : {_eu}")
+                                state.face_undetected_paths = []
+
+                            # Écriture sidecars
+                            if chk_face_write_sidecar.value:
+                                written = 0
+                                for p, persons in persons_by_path.items():
+                                    write_persons_sidecar(p, persons, float(face_threshold.value))
+                                    _invalidate_persons_cache(p)
+                                    written += 1
+                                state.add_log(f"[FACE] Sidecars _persons.json écrits : {written}")
+                            else:
+                                # Toujours invalider le cache pour les fichiers concernés
+                                for p in persons_by_path.keys():
+                                    _invalidate_persons_cache(p)
+
+                            state.add_log(f"✅ Recherche par visage terminée : {len(res)} fichiers, {sum(len(v) for v in persons_by_path.values())} détections.")
+                        except Exception as e:
+                            state.add_log(f"❌ Erreur de recherche par visage : {e}")
                         finally:
                             state.status_text = "Prêt !"
                             state.progress = 1.0
@@ -8145,9 +9786,10 @@ def index_page():
                         state.is_processing = False
                         state.status_text = "Prêt !"
                         state.progress = 1.0
-                    
-                with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
-                    btn_face = ui.button('🕵️ Rechercher Visage', on_click=run_face_action).classes('w-full bg-teal-600 hover:bg-teal-500 font-bold text-lg')
+
+                with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10 gap-2'):
+                    btn_load_face = ui.button('📂 Charger identifiés', on_click=lambda: load_face_identified_action()).classes('w-[45%] bg-gray-700 hover:bg-gray-600 font-bold text-sm').tooltip('Charger les images du dossier de recherche qui ont déjà un sidecar _persons.json')
+                    btn_face = ui.button('🕵️ Rechercher', on_click=run_face_action).classes('w-[55%] bg-teal-600 hover:bg-teal-500 font-bold text-lg')
 
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
                 face_gallery_ui()
@@ -9395,10 +11037,42 @@ def index_page():
                     if len(unique_files) < len(all_files):
                         state.add_log(f"[PROMPT] Doublons ignorés dans la galerie: {len(all_files) - len(unique_files)}")
 
+                    total = len(unique_files)
+                    state.status_text = f"Prompts: chargement ({total} fichiers)…"
+                    state.progress = 0.0
+
+                    # --- Bulk preload DB pour éviter 2*N requêtes SQL ---
+                    cached_prompt_map = {}
+                    cached_detailed_map = {}
+                    try:
+                        cur = search_engine.db_cache.conn.cursor()
+                        CHUNK = 900
+                        paths_list = unique_files
+                        for i in range(0, len(paths_list), CHUNK):
+                            sub = paths_list[i:i+CHUNK]
+                            qmarks = ','.join('?' * len(sub))
+                            try:
+                                cur.execute(f"SELECT path, source, prompt FROM prompt_cache WHERE path IN ({qmarks})", sub)
+                                for r in cur.fetchall():
+                                    cached_prompt_map[r[0]] = {'source': r[1], 'text': r[2]}
+                            except Exception: pass
+                            try:
+                                cur.execute(f"SELECT path, source, prompt FROM detailed_prompt_cache WHERE path IN ({qmarks})", sub)
+                                for r in cur.fetchall():
+                                    cached_detailed_map[r[0]] = {'source': r[1], 'text': r[2]}
+                            except Exception: pass
+                    except Exception as _e:
+                        state.add_log(f"[PROMPT] bulk preload fallback: {_e}")
+
                     res = []
-                    for path in unique_files:
-                        prompt_item = search_engine.db_cache.get_prompt(path) or {}
-                        detailed_item = search_engine.db_cache.get_detailed_prompt(path) or {}
+                    for idx, path in enumerate(unique_files):
+                        # Progress tous les 200 fichiers (ou à chaque fichier si <500 total)
+                        if total <= 500 or (idx % 200 == 0):
+                            state.status_text = f"Prompts: scan {idx+1}/{total} : {Path(path).name}"
+                            state.progress = idx / max(1, total)
+
+                        prompt_item = cached_prompt_map.get(path) or {}
+                        detailed_item = cached_detailed_map.get(path) or {}
                         prompt_source = str(prompt_item.get('source') or '').strip().lower()
                         prompt_text = str(prompt_item.get('text') or '').strip()
                         detailed_source = str(detailed_item.get('source') or '').strip().lower()
@@ -9437,8 +11111,17 @@ def index_page():
                                 prompt_source = 'file_sidecar'
                                 search_engine.db_cache.save_prompt(path, txt_content, source='file_sidecar')
 
-                        # Restore the embedded source prompt if a generated raw prompt replaced it earlier.
-                        if path.lower().endswith(SUPPORTED_IMAGES):
+                        # Optimisation: éviter d'ouvrir l'image si le cache est déjà fiable.
+                        # On n'extrait depuis l'image (coûteux) que si :
+                        #   - aucun prompt en cache, OU
+                        #   - le prompt cache vient d'une source non-image (sidecar, ollama…) ET pas de detailed
+                        need_image_extract = (
+                            path.lower().endswith(SUPPORTED_IMAGES) and (
+                                not prompt_text
+                                or (not prompt_source.startswith('image_metadata') and not detailed_text)
+                            )
+                        )
+                        if need_image_extract:
                             try:
                                 embedded = TagEngine._extract_prompt_from_image_metadata(path)
                                 if embedded:
@@ -9459,7 +11142,11 @@ def index_page():
                         if detailed_text:
                             score += 1.0
                         res.append((float(score), path, prompt_text, detailed_text, prompt_source, detailed_source))
+                    state.status_text = f"Prompts: tri de {total} résultats…"
+                    state.progress = 1.0
                     res.sort(key=lambda x: x[0], reverse=True)
+                    state.status_text = ""
+                    state.progress = 0.0
                     return res
 
                 def _tags_results_loaded() -> bool:
