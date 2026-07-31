@@ -6,6 +6,7 @@ Détecte le drone (Mini2 MEO, Neo2 CLEO, Avata2 GINO, Mini4 Pro PEDRO), la caté
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import io
 import json
@@ -22,6 +23,37 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PATCH pywebview / multiprocessing — MUST run BEFORE nicegui import
+# ─────────────────────────────────────────────────────────────────────────────
+# Fix "concurrent send_bytes() calls are not supported" causé par pywebview
+# qui émet plusieurs events (moved/resized/loaded) depuis des threads différents
+# sur la même multiprocessing.Connection. On sérialise avec un lock global.
+# Doit être exécuté au top-level du module pour être actif aussi dans le
+# processus enfant NiceGUI (__mp_main__).
+def _patch_mp_connection_thread_safety() -> None:
+    try:
+        import multiprocessing.connection as _mpc
+        if getattr(_mpc, "_dji_send_patched", False):
+            return
+        _orig_send = _mpc.Connection.send
+        _lock = threading.Lock()
+
+        def _safe_send(self, obj):  # type: ignore
+            with _lock:
+                try:
+                    return _orig_send(self, obj)
+                except (ValueError, BrokenPipeError, OSError):
+                    return None  # canal fermé / concurrent — ignorer
+
+        _mpc.Connection.send = _safe_send  # type: ignore
+        _mpc._dji_send_patched = True  # type: ignore
+    except Exception:
+        pass
+
+
+_patch_mp_connection_thread_safety()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dépendances tierces (installées via run_dji_organizator.bat)
@@ -133,6 +165,7 @@ class MediaUnit:
     drone_folder: str = UNKNOWN_DRONE_DIR
     category: str = "VIDEO"             # VIDEO / PHOTO / PANORAMA / HYPERLAPSE
     capture_date: str = ""              # YYYY-MM-DD
+    group_subdir: str = ""              # sous-dossier de groupe (PANO_001, HYPER_002…)
     action: str = "move"                # move | delete | skip
     detection_reason: str = ""
     error: str = ""
@@ -231,21 +264,29 @@ class DJIClassifier:
                 pass
 
     # ── drone ──────────────────────────────────────────────────────────────
-    def detect_drone(self, metadata: dict) -> tuple[str, str, str]:
-        """Retourne (drone_id, drone_folder, reason)."""
+    def detect_drone(self, metadata: dict, path: str = "") -> tuple[str, str, str]:
+        """Retourne (drone_id, drone_folder, reason).
+
+        Ordre : (1) EXIF/QT Model, (2) champs XMP DJI, (3) nom de fichier (FC7203…),
+        (4) hints dans le chemin (nom du drone dans un dossier parent).
+        """
+        # ── 1. Metadata Model ──
         candidates = [
             metadata.get("EXIF:Model"),
             metadata.get("QuickTime:Model"),
             metadata.get("XMP:Model"),
             metadata.get("MakerNotes:Model"),
             metadata.get("File:Model"),
+            metadata.get("EXIF:CameraModelName"),
+            metadata.get("QuickTime:HandlerDescription"),
         ]
         candidates = [c for c in candidates if c]
         blob = " ".join(str(c) for c in candidates).lower()
         for regex, drone_id, folder in self.mapping:
             if regex.search(blob):
                 return drone_id, folder, f"Model={blob.strip()} → {drone_id}"
-        # Fallback: chercher dans XMP:CreatorTool ou drone-dji
+
+        # ── 2. XMP DJI CreatorTool ou autres champs drone-dji ──
         for key in ("XMP:CreatorTool", "XMP-drone-dji:AbsoluteAltitude", "XMP:About"):
             val = metadata.get(key)
             if val:
@@ -253,7 +294,43 @@ class DJIClassifier:
                 for regex, drone_id, folder in self.mapping:
                     if regex.search(blob2):
                         return drone_id, folder, f"{key}={blob2} → {drone_id}"
+
+        # ── 3. Nom fichier — modèles caméra DJI ──
+        # FC7203=Mini 2, FC7503=Mini SE, FC8482=Mini 4 Pro, FC3411=Air 2S,
+        # FC3170=Air 2, FC8283=Neo, FC220=Mavic Pro, XT2=Avata2, etc.
+        name = Path(path).name.upper() if path else ""
+        # Certaines caméras encodent le modèle dans le nom fichier ou dans SourceFile
+        file_hints = {
+            r"FC7203": "MINI2-MEO",
+            r"FC8482": "MINI4PRO-PEDRO",
+            r"FC8283": "NEO2-CLEO",
+        }
+        for pat, drone_id in file_hints.items():
+            if re.search(pat, name):
+                folder = self._folder_for(drone_id)
+                return drone_id, folder, f"Nom fichier: {pat} → {drone_id}"
+
+        # ── 4. Hints dans le chemin (nom du drone dans un dossier parent) ──
+        if path:
+            path_blob = str(path).lower().replace("\\", "/")
+            path_hints = [
+                (r"\bmeo\b|mini\s*2", "MINI2-MEO"),
+                (r"\bcleo\b|\bneo\b", "NEO2-CLEO"),
+                (r"\bgino\b|avata", "AVATA2-GINO"),
+                (r"\bpedro\b|mini\s*4", "MINI4PRO-PEDRO"),
+            ]
+            for pat, drone_id in path_hints:
+                if re.search(pat, path_blob):
+                    folder = self._folder_for(drone_id)
+                    return drone_id, folder, f"Dossier parent: /{pat}/ → {drone_id}"
+
         return "UNKNOWN", UNKNOWN_DRONE_DIR, f"Aucun match (Model={blob or 'vide'})"
+
+    def _folder_for(self, drone_id: str) -> str:
+        for entry in CONFIG.get("drone_mapping", []):
+            if entry.get("id") == drone_id:
+                return entry.get("folder", UNKNOWN_DRONE_DIR)
+        return UNKNOWN_DRONE_DIR
 
     # ── catégorie ──────────────────────────────────────────────────────────
     def detect_category(self, path: str, metadata: dict) -> tuple[str, str]:
@@ -396,7 +473,7 @@ class DJIScanner:
             if progress_cb:
                 progress_cb("Classification et groupement…", idx + 1, len(media_files))
             meta = metadata_map.get(os.path.normpath(media_path), {})
-            drone_id, drone_folder, drone_reason = self.classifier.detect_drone(meta)
+            drone_id, drone_folder, drone_reason = self.classifier.detect_drone(meta, media_path)
             category, cat_reason = self.classifier.detect_category(media_path, meta)
             date_str = self.classifier.detect_capture_date(media_path, meta)
             companions_all = self.classifier.find_companions(media_path, all_files)
@@ -419,7 +496,85 @@ class DJIScanner:
                 detection_reason=f"Drone: {drone_reason} | Cat: {cat_reason}",
             )
             units.append(unit)
+
+        # ── Assignation des sous-dossiers de groupe pour PANORAMA / HYPERLAPSE ──
+        self._assign_group_subdirs(units)
         return units
+
+    def _assign_group_subdirs(self, units: list[MediaUnit]) -> None:
+        """Attribue un sous-dossier de groupe aux médias PANORAMA et HYPERLAPSE.
+
+        Règle : on prend le nom du dossier parent immédiat de la source si celui-ci
+        n'est PAS le dossier racine `00-DJI-A-TRIER` (ni un dossier générique
+        PANORAMA/HYPERLAPSE seul). Si aucun sous-dossier utile, on groupe par
+        proximité temporelle (photos prises à moins de 90 s d'écart sur le même
+        drone/jour = même panorama) et on assigne PANO_1, PANO_2…
+        """
+        src_root = os.path.normpath(self.source_dir).lower()
+        generic_names = {"panorama", "pano", "hyperlapse", "hyper", "photo", "photos",
+                         "video", "videos", "dcim", "media"}
+
+        # 1re passe : essayer d'utiliser le dossier parent source
+        for u in units:
+            if u.category not in ("PANORAMA", "HYPERLAPSE"):
+                continue
+            parent = Path(u.main_path).parent
+            candidate = None
+            probe = parent
+            while probe and os.path.normpath(str(probe)).lower() != src_root:
+                pname = probe.name.strip()
+                if pname and pname.lower() not in generic_names:
+                    candidate = pname
+                    break
+                probe = probe.parent
+            if candidate:
+                safe = re.sub(r'[<>:"/\\|?*]', "_", candidate).strip(" .")
+                if safe:
+                    u.group_subdir = safe
+
+        # 2e passe : grouper par proximité temporelle pour les "loose"
+        # Récupère timestamp complet depuis metadata
+        def _ts(u: MediaUnit) -> Optional[datetime]:
+            for k in ("EXIF:DateTimeOriginal", "EXIF:CreateDate",
+                      "QuickTime:CreateDate", "QuickTime:MediaCreateDate",
+                      "XMP:DateTimeOriginal", "XMP:CreateDate",
+                      "File:FileModifyDate"):
+                v = u.metadata.get(k)
+                if not v:
+                    continue
+                s = str(v).strip()
+                # format exiftool: "2026:07:25 18:30:45[+/-HH:MM]"
+                m = re.match(r"(\d{4})[:\-/](\d{2})[:\-/](\d{2})[ T](\d{2}):(\d{2}):(\d{2})", s)
+                if m:
+                    try:
+                        return datetime(*(int(g) for g in m.groups()))
+                    except ValueError:
+                        continue
+            try:
+                return datetime.fromtimestamp(os.path.getmtime(u.main_path))
+            except OSError:
+                return None
+
+        # Buckets : (drone_folder, date, catégorie) → liste triée par timestamp
+        buckets: dict[tuple[str, str, str], list[tuple[Optional[datetime], MediaUnit]]] = {}
+        for u in units:
+            if u.category not in ("PANORAMA", "HYPERLAPSE") or u.group_subdir:
+                continue
+            key = (u.drone_folder, u.capture_date, u.category)
+            buckets.setdefault(key, []).append((_ts(u), u))
+
+        for (drone_folder, date, cat), lst in buckets.items():
+            prefix = "PANO" if cat == "PANORAMA" else "HYPER"
+            # Tri par timestamp (None en dernier), puis par nom pour stabilité
+            lst.sort(key=lambda t: (t[0] or datetime.max, Path(t[1].main_path).name.lower()))
+            # Regroupe : nouveau groupe si écart > 90 s avec le précédent
+            group_idx = 0
+            last_ts: Optional[datetime] = None
+            for ts, u in lst:
+                if last_ts is None or ts is None or (ts - last_ts).total_seconds() > 90:
+                    group_idx += 1
+                u.group_subdir = f"{prefix}_{group_idx:03d}"
+                last_ts = ts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -499,6 +654,9 @@ class DJIOrganizer:
 
     def _destination_for(self, unit: MediaUnit, file_path: str) -> Path:
         dest_root = Path(self.destination_dir) / unit.drone_folder / unit.capture_date / unit.category
+        # Sous-dossier de groupe pour PANORAMA/HYPERLAPSE
+        if unit.group_subdir and unit.category in ("PANORAMA", "HYPERLAPSE"):
+            dest_root = dest_root / unit.group_subdir
         return dest_root / Path(file_path).name
 
     def _resolve_conflict(self, target: Path) -> Optional[Path]:
@@ -669,6 +827,7 @@ class DJIOrganizer:
                     "drone_folder": u.drone_folder,
                     "category": u.category,
                     "capture_date": u.capture_date,
+                    "group_subdir": u.group_subdir,
                     "action": u.action,
                     "detection_reason": u.detection_reason,
                     "metadata_exiftool": u.metadata,
@@ -772,6 +931,53 @@ def image_to_data_uri(path: str) -> str:
         return ""
 
 
+# ── Sélecteur de dossier natif (sous-processus tkinter, 100% async) ──
+_TK_PICKER_SCRIPT = (
+    "import sys, tkinter as tk\n"
+    "from tkinter import filedialog\n"
+    "root = tk.Tk()\n"
+    "root.attributes('-topmost', True)\n"
+    "root.withdraw()\n"
+    "try:\n"
+    "    folder = filedialog.askdirectory()\n"
+    "finally:\n"
+    "    try: root.destroy()\n"
+    "    except Exception: pass\n"
+    "sys.stdout.write(folder or '')\n"
+    "sys.stdout.flush()\n"
+)
+
+
+async def select_folder_async(initial_dir: str = "") -> str:
+    """Ouvre un dialogue tkinter dans un sous-processus séparé, 100% non-bloquant.
+
+    Créer tkinter sur un thread NiceGUI/uvicorn fige Windows. On délègue à un
+    Python séparé piloté par asyncio.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", _TK_PICKER_SCRIPT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return ""
+        result = (stdout or b"").decode("utf-8", errors="ignore").strip()
+        # tkinter renvoie avec des slash /, on normalise pour Windows
+        if result:
+            result = os.path.normpath(result)
+        return result
+    except Exception:
+        return ""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # APPLICATION UI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -794,6 +1000,11 @@ class DJIOrganizatorApp:
         self._filter_drone = "TOUS"
         self._filter_category = "TOUTES"
         self._selected_units: set[str] = set()
+        # Pagination
+        self._page_size = 24
+        self._current_page = 0
+        self._pagination_container = None
+        self._page_info_label = None
 
     # ── logging ────────────────────────────────────────────────────────────
     def log(self, msg: str) -> None:
@@ -830,8 +1041,29 @@ class DJIOrganizatorApp:
         with ui.step("Configuration").props("icon=folder_open"):
             with ui.card().classes("w-full"):
                 ui.label("Dossiers").classes("text-h6")
-                src = ui.input("Dossier source (à trier)", value=self.source_dir).classes("w-full")
-                dst = ui.input("Dossier destination racine", value=self.destination_dir).classes("w-full")
+
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    src = ui.input("Dossier source (à trier)", value=self.source_dir).classes("flex-grow")
+
+                    async def _pick_source() -> None:
+                        picked = await select_folder_async(src.value)
+                        if picked:
+                            src.value = picked
+                            src.update()
+
+                    ui.button(icon="folder", on_click=_pick_source).props("flat round").tooltip("Choisir le dossier source")
+
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    dst = ui.input("Dossier destination racine", value=self.destination_dir).classes("flex-grow")
+
+                    async def _pick_dest() -> None:
+                        picked = await select_folder_async(dst.value)
+                        if picked:
+                            dst.value = picked
+                            dst.update()
+
+                    ui.button(icon="folder", on_click=_pick_dest).props("flat round").tooltip("Choisir le dossier destination")
+
                 trash_sw = ui.switch("Envoyer les originaux à la corbeille après copie réussie",
                                      value=self.send_to_trash)
 
@@ -915,6 +1147,22 @@ class DJIOrganizatorApp:
                     ui.button("Tout → Effacer", on_click=lambda: self._bulk_action("delete")).props("flat color=negative")
                     ui.button("Tout → Ignorer", on_click=lambda: self._bulk_action("skip")).props("flat")
 
+                # Ligne pour réassignement drone en masse (utile pour Mini 2 dont les métadonnées sont vides)
+                with ui.row().classes("w-full items-center gap-2 mt-2"):
+                    ui.label("Réassigner drone des filtrés :").classes("text-body2")
+                    drone_ids = [d["id"] for d in CONFIG.get("drone_mapping", [])]
+                    self._bulk_drone_target = ui.select(
+                        options=drone_ids,
+                        value=drone_ids[0] if drone_ids else "MINI2-MEO",
+                        label="→ Drone cible",
+                    ).classes("min-w-40")
+                    ui.button(
+                        "Réassigner filtrés",
+                        icon="swap_horiz",
+                        on_click=self._bulk_reassign_drone,
+                    ).props("color=primary")
+                    ui.label("(applique le filtre courant Drone/Catégorie)").classes("text-caption text-grey-6")
+
                 self._review_container = ui.column().classes("w-full gap-2")
 
             with ui.stepper_navigation():
@@ -931,24 +1179,96 @@ class DJIOrganizatorApp:
             pass
         self._apply_filters()
 
-    def _apply_filters(self) -> None:
+    def _apply_filters(self, reset_page: bool = True) -> None:
         if self._review_container is None:
             return
         drone_f = getattr(self._drone_filter_sel, "value", "TOUS")
         cat_f = getattr(self._cat_filter_sel, "value", "TOUTES")
+
+        visible = [
+            u for u in self.units
+            if (drone_f == "TOUS" or u.drone_id == drone_f)
+            and (cat_f == "TOUTES" or u.category == cat_f)
+        ]
+
+        # Construction des items d'affichage : les PANO/HYPER partageant le même
+        # (drone_folder, capture_date, category, group_subdir) sont regroupés en un seul.
+        display_items: list[dict[str, Any]] = []
+        seen_groups: set[tuple[str, str, str, str]] = set()
+        for u in visible:
+            if u.category in ("PANORAMA", "HYPERLAPSE") and u.group_subdir:
+                key = (u.drone_folder, u.capture_date, u.category, u.group_subdir)
+                if key in seen_groups:
+                    continue
+                seen_groups.add(key)
+                members = [
+                    v for v in visible
+                    if v.category == u.category
+                    and v.drone_folder == u.drone_folder
+                    and v.capture_date == u.capture_date
+                    and v.group_subdir == u.group_subdir
+                ]
+                display_items.append({"kind": "group", "units": members, "key": key})
+            else:
+                display_items.append({"kind": "single", "unit": u})
+
+        # Pagination
+        total = len(display_items)
+        page_size = self._page_size
+        pages = max(1, (total + page_size - 1) // page_size)
+        if reset_page:
+            self._current_page = 0
+        if self._current_page >= pages:
+            self._current_page = pages - 1
+        start = self._current_page * page_size
+        end = min(start + page_size, total)
+        page_items = display_items[start:end]
+
         self._review_container.clear()
         with self._review_container:
-            visible = [
-                u for u in self.units
-                if (drone_f == "TOUS" or u.drone_id == drone_f)
-                and (cat_f == "TOUTES" or u.category == cat_f)
-            ]
-            if not visible:
+            # Barre pagination haut
+            self._render_pagination_bar(total, pages, start, end, top=True)
+
+            if not page_items:
                 ui.label("Aucun média correspondant aux filtres.").classes("text-caption")
                 return
             with ui.grid(columns=3).classes("w-full gap-3"):
-                for unit in visible:
-                    self._render_unit_card(unit)
+                for item in page_items:
+                    if item["kind"] == "single":
+                        self._render_unit_card(item["unit"])
+                    else:
+                        self._render_group_card(item["units"])
+
+            # Barre pagination bas
+            self._render_pagination_bar(total, pages, start, end, top=False)
+
+    def _render_pagination_bar(self, total: int, pages: int, start: int, end: int, top: bool) -> None:
+        with ui.row().classes("w-full items-center gap-2 py-1"):
+            ui.button(icon="first_page", on_click=lambda: self._goto_page(0)).props("flat dense").tooltip("Première page")
+            ui.button(icon="chevron_left", on_click=lambda: self._goto_page(self._current_page - 1)).props("flat dense").tooltip("Précédente")
+            ui.label(f"{start + 1}-{end} / {total}  ·  page {self._current_page + 1}/{pages}").classes("text-body2")
+            ui.button(icon="chevron_right", on_click=lambda: self._goto_page(self._current_page + 1)).props("flat dense").tooltip("Suivante")
+            ui.button(icon="last_page", on_click=lambda: self._goto_page(pages - 1)).props("flat dense").tooltip("Dernière page")
+            if top:
+                ui.space()
+                ui.label("Par page :").classes("text-caption")
+                ui.select(
+                    options=[12, 24, 48, 96],
+                    value=self._page_size,
+                    on_change=lambda e: self._change_page_size(e.value),
+                ).props("dense options-dense").classes("w-24")
+
+    def _goto_page(self, n: int) -> None:
+        self._current_page = max(0, n)
+        self._apply_filters(reset_page=False)
+
+    def _change_page_size(self, n: int) -> None:
+        try:
+            self._page_size = int(n)
+        except (TypeError, ValueError):
+            return
+        self._current_page = 0
+        self._apply_filters(reset_page=False)
 
     def _render_unit_card(self, unit: MediaUnit) -> None:
         with ui.card().classes("w-full"):
@@ -966,6 +1286,8 @@ class DJIOrganizatorApp:
                 ui.badge(unit.drone_id, color="primary")
                 ui.badge(unit.category, color="secondary")
                 ui.badge(unit.capture_date, color="grey")
+                if unit.group_subdir and unit.category in ("PANORAMA", "HYPERLAPSE"):
+                    ui.badge(unit.group_subdir, color="orange").tooltip("Sous-dossier de groupe")
             if unit.companions:
                 ui.label(f"+ {len(unit.companions)} compagnon(s)").classes("text-caption text-grey-7").tooltip(
                     "\n".join(unit.companions)
@@ -1016,6 +1338,89 @@ class DJIOrganizatorApp:
                     on_change=_on_action_change,
                 ).props("dense options-dense").classes("min-w-36")
 
+    def _render_group_card(self, members: list[MediaUnit]) -> None:
+        """Carte représentant un groupe PANORAMA/HYPERLAPSE (plusieurs photos en 1)."""
+        first = members[0]
+        total_size = sum(u.total_size for u in members)
+        total_companions = sum(len(u.companions) for u in members)
+
+        with ui.card().classes("w-full border-2 border-orange-4"):
+            thumb = generate_thumbnail(first.main_path, size=256)
+            if thumb:
+                # Overlay avec le compte de photos
+                with ui.element("div").classes("relative w-full"):
+                    ui.image(image_to_data_uri(thumb)).classes("w-full h-40 object-cover rounded")
+                    with ui.element("div").classes(
+                        "absolute top-1 right-1 bg-orange-8 text-white text-caption px-2 py-1 rounded-lg"
+                    ):
+                        ui.label(f"×{len(members)}").classes("text-body2 font-bold")
+                    with ui.element("div").classes(
+                        "absolute bottom-1 left-1 bg-black bg-opacity-70 text-white text-caption px-2 py-1 rounded"
+                    ):
+                        ui.icon("photo_library").classes("text-white")
+            else:
+                with ui.element("div").classes(
+                    "w-full h-40 flex items-center justify-center bg-orange-2 rounded"
+                ):
+                    ui.icon("photo_library").classes("text-4xl text-orange-8")
+
+            ui.label(f"📂 {first.group_subdir}").classes("text-body1 font-bold truncate").tooltip(
+                "\n".join(Path(u.main_path).name for u in members)
+            )
+            ui.label(f"{len(members)} fichier(s) — {first.category}").classes("text-caption")
+
+            with ui.row().classes("items-center gap-1"):
+                ui.badge(first.drone_id, color="primary")
+                ui.badge(first.category, color="secondary")
+                ui.badge(first.capture_date, color="grey")
+                ui.badge(first.group_subdir, color="orange")
+
+            if total_companions:
+                ui.label(f"+ {total_companions} compagnon(s) au total").classes("text-caption text-grey-7")
+            ui.label(f"Taille totale: {human_size(total_size)}").classes("text-caption")
+
+            # Éditables : drone, catégorie, action — appliqués à TOUS les membres
+            with ui.row().classes("w-full gap-1 items-center"):
+                drone_opts = {d["id"]: d["id"] for d in CONFIG.get("drone_mapping", [])}
+                drone_opts["UNKNOWN"] = "UNKNOWN"
+                if first.drone_id not in drone_opts:
+                    drone_opts[first.drone_id] = first.drone_id
+
+                def _on_drone_change(e, ms=members) -> None:
+                    new_val = e.value
+                    for m in ms:
+                        m.drone_id = new_val
+                        _sync_folder(m)
+
+                ui.select(
+                    options=drone_opts,
+                    value=first.drone_id,
+                    label="Drone",
+                    on_change=_on_drone_change,
+                ).props("dense options-dense").classes("min-w-28")
+
+                def _on_cat_change(e, ms=members) -> None:
+                    for m in ms:
+                        m.category = e.value
+
+                ui.select(
+                    options={c: c for c in CATEGORIES},
+                    value=first.category,
+                    label="Cat",
+                    on_change=_on_cat_change,
+                ).props("dense options-dense").classes("min-w-28")
+
+                def _on_action_change(e, ms=members) -> None:
+                    for m in ms:
+                        m.action = e.value
+
+                ui.select(
+                    options={"move": "📥 Déplacer (groupe)", "delete": "🗑️ Effacer (groupe)", "skip": "⏭️ Ignorer (groupe)"},
+                    value=first.action,
+                    label="Action",
+                    on_change=_on_action_change,
+                ).props("dense options-dense").classes("min-w-40")
+
 
     # ── actions groupées ───────────────────────────────────────────────────
     def _bulk_action(self, action: str) -> None:
@@ -1027,6 +1432,39 @@ class DJIOrganizatorApp:
                 u.action = action
                 count += 1
         ui.notify(f"{count} média(s) → {action}", type="info")
+        self._apply_filters()
+
+    def _bulk_reassign_drone(self) -> None:
+        """Réassigne le drone à tous les médias correspondant aux filtres courants."""
+        target = getattr(self._bulk_drone_target, "value", None)
+        if not target:
+            ui.notify("Choisir un drone cible", type="warning")
+            return
+        # Trouver le dossier correspondant au drone cible
+        folder = UNKNOWN_DRONE_DIR
+        for d in CONFIG.get("drone_mapping", []):
+            if d.get("id") == target:
+                folder = d.get("folder", UNKNOWN_DRONE_DIR)
+                break
+
+        drone_f = getattr(self._drone_filter_sel, "value", "TOUS")
+        cat_f = getattr(self._cat_filter_sel, "value", "TOUTES")
+        count = 0
+        for u in self.units:
+            if (drone_f == "TOUS" or u.drone_id == drone_f) and (cat_f == "TOUTES" or u.category == cat_f):
+                u.drone_id = target
+                u.drone_folder = folder
+                count += 1
+        ui.notify(f"{count} média(s) réassignés → {target}", type="positive")
+        # Rafraîchir la liste des drones dans le filtre + réappliquer
+        try:
+            drones = sorted({u.drone_id for u in self.units})
+            self._drone_filter_sel.options = ["TOUS"] + drones
+            if self._drone_filter_sel.value not in self._drone_filter_sel.options:
+                self._drone_filter_sel.value = "TOUS"
+            self._drone_filter_sel.update()
+        except Exception:
+            pass
         self._apply_filters()
 
     # ── ÉTAPE 4 : Confirmation ─────────────────────────────────────────────
@@ -1077,22 +1515,35 @@ class DJIOrganizatorApp:
                     ui.label(line).classes("text-caption font-mono")
 
     def _build_dest_tree(self, units: list[MediaUnit]) -> list[str]:
-        tree: dict[str, dict[str, dict[str, list[str]]]] = {}
+        # tree[drone][date][category][group] = [filenames]
+        tree: dict[str, dict[str, dict[str, dict[str, list[str]]]]] = {}
         for u in units:
-            tree.setdefault(u.drone_folder, {}).setdefault(u.capture_date, {}).setdefault(u.category, []).append(
-                Path(u.main_path).name
-            )
+            group = u.group_subdir if u.category in ("PANORAMA", "HYPERLAPSE") and u.group_subdir else ""
+            (tree.setdefault(u.drone_folder, {})
+                 .setdefault(u.capture_date, {})
+                 .setdefault(u.category, {})
+                 .setdefault(group, [])
+                 .append(Path(u.main_path).name))
         lines: list[str] = []
         for drone, dates in sorted(tree.items()):
             lines.append(f"📂 {drone}/")
             for date, cats in sorted(dates.items()):
                 lines.append(f"   📅 {date}/")
-                for cat, files in sorted(cats.items()):
-                    lines.append(f"      📁 {cat}/  ({len(files)} fichier(s))")
-                    for fn in files[:5]:
-                        lines.append(f"         · {fn}")
-                    if len(files) > 5:
-                        lines.append(f"         · … +{len(files) - 5} autres")
+                for cat, groups in sorted(cats.items()):
+                    total = sum(len(v) for v in groups.values())
+                    lines.append(f"      📁 {cat}/  ({total} fichier(s))")
+                    for group, files in sorted(groups.items()):
+                        if group:
+                            lines.append(f"         📁 {group}/  ({len(files)})")
+                            for fn in files[:5]:
+                                lines.append(f"            · {fn}")
+                            if len(files) > 5:
+                                lines.append(f"            · … +{len(files) - 5} autres")
+                        else:
+                            for fn in files[:5]:
+                                lines.append(f"         · {fn}")
+                            if len(files) > 5:
+                                lines.append(f"         · … +{len(files) - 5} autres")
         if not lines:
             lines.append("(rien à déplacer)")
         return lines

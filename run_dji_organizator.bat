@@ -41,6 +41,7 @@ if not exist ".venv\Lib\site-packages\send2trash" (
 )
 
 :: ---- Téléchargement d'ExifTool binaire si absent ----
+:: Utilise le paquet Oliver Betz (launcher .exe + dossier exiftool_files avec Perl embarqué)
 if not exist ".tools\exiftool\exiftool.exe" (
     echo Téléchargement d'ExifTool...
     mkdir ".tools\exiftool" 2>nul
@@ -53,10 +54,22 @@ if not exist ".tools\exiftool\exiftool.exe" (
     )
     powershell -Command "Expand-Archive -Path '.tools\exiftool\exiftool.zip' -DestinationPath '.tools\exiftool' -Force"
     del ".tools\exiftool\exiftool.zip" 2>nul
-    :: L'archive contient un exécutable nommé exiftool(-k).exe ou exiftool.exe selon la version.
+
+    :: Cas 1 (paquet Oliver Betz récent) : le launcher exiftool.exe est déjà présent
+    :: mais le dossier des dépendances Perl s'appelle 'exiftool' — il DOIT être renommé
+    :: en 'exiftool_files' sinon le launcher ne trouve pas perl5*.dll.
+    if exist ".tools\exiftool\exiftool" (
+        if not exist ".tools\exiftool\exiftool_files" (
+            ren ".tools\exiftool\exiftool" "exiftool_files"
+        )
+    )
+
+    :: Cas 2 (ancien paquet Phil Harvey) : exécutable nommé exiftool(-k).exe
     if exist ".tools\exiftool\exiftool(-k).exe" (
         move /Y ".tools\exiftool\exiftool(-k).exe" ".tools\exiftool\exiftool.exe" >nul
     )
+
+    :: Cas 3 (paquet dans un sous-dossier exiftool-*)
     for /d %%D in (".tools\exiftool\exiftool-*") do (
         if exist "%%D\exiftool(-k).exe" (
             move /Y "%%D\exiftool(-k).exe" ".tools\exiftool\exiftool.exe" >nul

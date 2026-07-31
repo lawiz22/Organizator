@@ -52,8 +52,14 @@ ollama_runtime.log
 
 # Thumbnail / image cache
 .thumbs/
+.cache_dji_thumbs/
 image_cache.db-shm
 image_cache.db-wal
+
+# DJI Organizator runtime
+.tools/
+dji_config.json
+Logs_DJI_ORGZ/
 
 # Large model files (multi-GB, not tracked in git)
 models/
