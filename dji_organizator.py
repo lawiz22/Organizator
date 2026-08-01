@@ -218,6 +218,7 @@ class MediaUnit:
     detection_reason: str = ""
     error: str = ""
     tags: list[str] = field(default_factory=list)  # noms de tags (voir CONFIG["tags"])
+    custom_name: str = ""               # nom personnalisé donné par l'utilisateur
 
     @property
     def key(self) -> str:
@@ -1347,6 +1348,7 @@ class DJIOrganizer:
                 "group_subdir": unit.group_subdir,
                 "detection_reason": unit.detection_reason,
                 "tags": list(unit.tags or []),
+                "custom_name": unit.custom_name or "",
             },
             "files": {
                 "source": unit.main_path,
@@ -1812,22 +1814,21 @@ async def select_folder_async(initial_dir: str = "") -> str:
 class _TabController:
     """Petit shim compatible avec l'API ancienne du stepper : .next() / .previous() / .set().
 
-    Utilisé pour piloter des onglets `ui.tabs` + `ui.tab_panels` en remplacement du
-    `ui.stepper` vertical. Permet aux méthodes existantes d'appeler `self._stepper.next()`
-    sans changements.
+    Gère deux niveaux d'onglets : outer (Workflow / Drones / Tags / Visualisateur / Recherche)
+    + inner (Config / Scan / Revue / Confirmation / Exécution) à l'intérieur de Workflow.
     """
-    # Ordre linéaire du workflow uniquement (les tabs "drones" et "viewer" sont
-    # accessibles par clic direct, pas via next()/previous()).
-    ORDER = ["config", "scan", "review", "confirm", "execute", "drones", "viewer"]
+    OUTER = ["workflow", "drones", "tags", "viewer", "search"]
     WORKFLOW = ["config", "scan", "review", "confirm", "execute"]
 
-    def __init__(self, tabs, panels) -> None:
-        self.tabs = tabs
-        self.panels = panels
+    def __init__(self, outer_tabs, outer_panels, inner_tabs, inner_panels) -> None:
+        self.outer_tabs = outer_tabs
+        self.outer_panels = outer_panels
+        self.inner_tabs = inner_tabs
+        self.inner_panels = inner_panels
 
     def _current_idx(self) -> int:
         try:
-            return self.WORKFLOW.index(self.tabs.value)
+            return self.WORKFLOW.index(self.inner_tabs.value)
         except (ValueError, TypeError):
             return 0
 
@@ -1842,18 +1843,37 @@ class _TabController:
             self._goto(self.WORKFLOW[i - 1])
 
     def set(self, name: str) -> None:
-        if name in self.ORDER:
+        if name in self.WORKFLOW:
             self._goto(name)
+        elif name in self.OUTER:
+            self._set_outer(name)
 
     def _goto(self, name: str) -> None:
+        # Assure que Workflow est actif
+        self._set_outer("workflow")
         try:
-            self.tabs.set_value(name)
+            self.inner_tabs.set_value(name)
         except Exception:
-            self.tabs.value = name
+            self.inner_tabs.value = name
         try:
-            self.panels.set_value(name)
+            self.inner_panels.set_value(name)
         except Exception:
-            self.panels.value = name
+            self.inner_panels.value = name
+
+    def _set_outer(self, name: str) -> None:
+        try:
+            self.outer_tabs.set_value(name)
+        except Exception:
+            self.outer_tabs.value = name
+        try:
+            self.outer_panels.set_value(name)
+        except Exception:
+            self.outer_panels.value = name
+
+    # Rétrocompat : `.tabs` renvoie les outer tabs (pour set_value externe)
+    @property
+    def tabs(self):
+        return self.outer_tabs
 
 
 class DJIOrganizatorApp:
@@ -1878,6 +1898,16 @@ class DJIOrganizatorApp:
         self._selection_bar_container = None            # placeholder pour la barre de sélection Review
         self._selected_viewer_files: set[str] = set()   # chemins sélectionnés dans le visualiseur
         self._viewer_selection_bar = None               # placeholder pour la barre de sélection Viewer
+        # Recherche
+        self._search_results_container = None
+        self._search_name_input = None
+        self._search_date_from = None
+        self._search_date_to = None
+        self._search_tag_sel = None
+        self._search_cat_sel = None
+        self._search_drone_sel = None
+        self._search_count_label = None
+        self._search_tag_mode = None
         # Pagination
         self._page_size = 24
         self._current_page = 0
@@ -1900,8 +1930,12 @@ class DJIOrganizatorApp:
             "month": _now.month,
             "drone_filter": "TOUS",     # ID de drone ou "TOUS"
             "cat_filter": "TOUTES",     # nom de catégorie ou "TOUTES"
+            "group_mode": "cat",        # "cat" : compte par catégorie ;
+                                        # "tag" : compte par tag (chips MEO 3sunset…)
+            "tag_filter": [],           # tags à conserver (liste multi-sélection)
         }
         self._calendar_index_cache: Optional[dict[str, Any]] = None
+        self._calendar_tag_index_cache: Optional[dict[str, Any]] = None
         # Assets déjà enregistrés ?
         self._assets_registered = False
         # Racines destination déjà enregistrées pour l'aperçu viewer
@@ -1982,6 +2016,12 @@ class DJIOrganizatorApp:
             background: rgba(0, 0, 0, 0.65);
             opacity: 1;
         }
+        /* Onglets : masque les flèches de scroll horizontal (on veut tout voir) */
+        .q-tabs__arrow { display: none !important; }
+        /* Onglets un poil plus compacts pour tenir sur une ligne */
+        .q-tab { padding: 0 10px !important; min-height: 40px !important; }
+        .q-tab__label { font-size: 12.5px !important; letter-spacing: 0.2px; }
+        .q-tab__icon { font-size: 18px !important; }
         </style>
         """)
 
@@ -1991,28 +2031,46 @@ class DJIOrganizatorApp:
             ui.space()
             ui.label(f"v1.0 · port {app.config.port if hasattr(app.config, 'port') else 8192}").classes("text-caption")
 
-        with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-4"):
-            # Barre d'onglets horizontale (remplace le stepper vertical)
-            with ui.tabs().props("dense inline-label active-color=primary indicator-color=primary").classes("w-full") as tabs:
-                ui.tab("config",  label="Configuration", icon="folder_open")
-                ui.tab("scan",    label="Scan",          icon="search")
-                ui.tab("review",  label="Revue",         icon="preview")
-                ui.tab("confirm", label="Confirmation",  icon="fact_check")
-                ui.tab("execute", label="Exécution",     icon="done_all")
-                ui.tab("drones",  label="Drones",        icon="flight_takeoff")
-                ui.tab("tags",    label="Tags",          icon="sell")
-                ui.tab("viewer",  label="Visualiseur",   icon="collections")
+        with ui.column().classes("w-full max-w-7xl mx-auto p-4 gap-4"):
+            # Barre d'onglets principale — 5 sections seulement (le workflow
+            # est groupé en sous-onglets à l'intérieur de "Workflow")
+            with ui.tabs().props(
+                "dense inline-label active-color=primary indicator-color=primary "
+                "align=left no-caps"
+            ).classes("w-full") as tabs:
+                ui.tab("workflow", label="Workflow",     icon="rocket_launch")
+                ui.tab("drones",   label="Drones",        icon="flight_takeoff")
+                ui.tab("tags",     label="Tags",          icon="sell")
+                ui.tab("viewer",   label="Visualiseur",   icon="collections")
+                ui.tab("search",   label="Recherche",     icon="manage_search")
 
-            with ui.tab_panels(tabs, value="config").classes("w-full") as panels:
-                self._stepper = _TabController(tabs, panels)
-                self._step_config()
-                self._step_scan()
-                self._step_review()
-                self._step_confirm()
-                self._step_execute()
+            with ui.tab_panels(tabs, value="workflow").classes("w-full") as panels:
+                # Onglet Workflow contient les 5 sous-étapes
+                with ui.tab_panel("workflow"):
+                    with ui.tabs().props(
+                        "dense inline-label active-color=primary "
+                        "indicator-color=primary align=left no-caps"
+                    ).classes("w-full") as inner_tabs:
+                        ui.tab("config",  label="Configuration", icon="folder_open")
+                        ui.tab("scan",    label="Scan",          icon="search")
+                        ui.tab("review",  label="Revue",         icon="preview")
+                        ui.tab("confirm", label="Confirmation",  icon="fact_check")
+                        ui.tab("execute", label="Exécution",     icon="done_all")
+                    with ui.tab_panels(inner_tabs, value="config").classes(
+                        "w-full"
+                    ) as inner_panels:
+                        self._stepper = _TabController(
+                            tabs, panels, inner_tabs, inner_panels
+                        )
+                        self._step_config()
+                        self._step_scan()
+                        self._step_review()
+                        self._step_confirm()
+                        self._step_execute()
                 self._step_drones()
                 self._step_tags()
                 self._step_viewer()
+                self._step_search()
 
             # Ouvre automatiquement le viewer quand on clique sur son tab
             tabs.on_value_change(self._on_tab_change)
@@ -2434,6 +2492,7 @@ class DJIOrganizatorApp:
         unit: MediaUnit,
         source: str = "review",
         on_deleted: Optional[Callable[[], None]] = None,
+        on_close: Optional[Callable[[], None]] = None,
     ) -> None:
         """Ouvre un dialog plein écran avec l'image/vidéo et une mini-carte GPS.
 
@@ -2441,6 +2500,9 @@ class DJIOrganizatorApp:
             - "review"  → suppression retire l'unit de `self.units` (avant copie)
             - "viewer"  → suppression envoie le fichier disque (+ sidecar) à la corbeille
         `on_deleted` : callback optionnel appelé après suppression réussie.
+        `on_close`   : callback optionnel appelé à la fermeture du dialog
+                       (utile pour rafraîchir la vue parente si les tags/nom
+                       du média ont été modifiés depuis l'aperçu).
         """
         is_video = Path(unit.main_path).suffix.lower() in VIDEO_EXTS
         media_url = self._media_url_for(unit.main_path)
@@ -2500,6 +2562,16 @@ class DJIOrganizatorApp:
 
                 # Colonne carte + infos
                 with ui.column().classes("w-96 h-full gap-2"):
+                    # Nom personnalisé (persisté dans le sidecar quand on est en mode viewer)
+                    with ui.card().classes("w-full q-pa-sm"):
+                        ui.label("✏️ Nom personnalisé").classes("text-subtitle2")
+                        self._render_custom_name_row(
+                            unit,
+                            on_change=(
+                                self._apply_filters if source == "review" else None
+                            ),
+                            on_disk=(source == "viewer"),
+                        )
                     # Ligne tags (persistée dans le sidecar quand on est en mode viewer)
                     with ui.card().classes("w-full q-pa-sm"):
                         ui.label("🏷️ Tags").classes("text-subtitle2")
@@ -2628,13 +2700,20 @@ class DJIOrganizatorApp:
                                     continue
                                 if needle and needle not in key.lower() and needle not in val_str.lower():
                                     continue
-                                with ui.row().classes("w-full no-wrap gap-1 items-start"):
+                                with ui.row().classes("w-full no-wrap gap-1 items-start q-py-none").style(
+                                    "line-height:1.15; margin:0;"
+                                ):
                                     ui.label(f"{key}:").classes(
-                                        "text-caption font-mono text-primary w-64 truncate"
+                                        "font-mono text-primary truncate"
+                                    ).style(
+                                        "font-size:10px; width:180px; margin:0; padding:0;"
                                     ).tooltip(key)
                                     ui.label(val_str).classes(
-                                        "text-caption font-mono flex-grow break-all"
-                                    ).style("word-break: break-all;")
+                                        "font-mono flex-grow break-all"
+                                    ).style(
+                                        "font-size:10px; word-break:break-all; "
+                                        "margin:0; padding:0;"
+                                    )
                                 shown += 1
                             if shown == 0:
                                 ui.label("(aucun tag ne correspond au filtre)").classes(
@@ -2655,9 +2734,21 @@ class DJIOrganizatorApp:
                             ),
                         ).props("flat dense size=sm")
 
+        # Rafraîchit la vue parente à la fermeture (tags/nom personnalisé
+        # ont pu être modifiés depuis l'aperçu).
+        if on_close is not None:
+            def _fire_on_close(e) -> None:
+                if not e.value:
+                    try:
+                        on_close()
+                    except Exception:
+                        pass
+            dlg.on_value_change(_fire_on_close)
+
         dlg.open()
 
     def _render_unit_card(self, unit: MediaUnit) -> None:
+        """Carte d'un média individuel (mode Revue)."""
         with ui.card().classes("w-full"):
             thumb = generate_thumbnail(unit.main_path, size=256)
             with ui.element("div").classes("relative w-full cursor-pointer").on(
@@ -2696,6 +2787,8 @@ class DJIOrganizatorApp:
                     cb.tooltip("Sélectionner pour effacer en lot")
 
             ui.label(Path(unit.main_path).name).classes("text-body2 truncate").tooltip(unit.main_path)
+            # Nom personnalisé (édition inline)
+            self._render_custom_name_row(unit, on_change=self._apply_filters)
             with ui.row().classes("items-center gap-1"):
                 ui.badge(unit.drone_id, color="primary")
                 ui.badge(unit.category, color="secondary")
@@ -2761,6 +2854,143 @@ class DJIOrganizatorApp:
 
             # Ligne tags (chips + bouton ajouter)
             self._render_tags_row([unit], on_change=self._apply_filters)
+
+    def _render_custom_name_row(
+        self,
+        unit: MediaUnit,
+        on_change: Optional[Callable[[], None]] = None,
+        on_disk: bool = False,
+    ) -> None:
+        """Affiche le nom personnalisé (si présent) + bouton crayon pour éditer.
+
+        `on_disk=True` : écrit aussi dans le sidecar sur disque (mode viewer).
+        Rangée auto-rafraîchissante — pas besoin de recharger la vue.
+        """
+        outer = ui.row().classes("w-full items-center gap-1 q-mt-xs").style(
+            "min-height:20px;"
+        )
+
+        def _save(new_name: str) -> None:
+            unit.custom_name = new_name
+            if on_disk:
+                self._update_sidecar_custom_name(unit.main_path, new_name)
+            action = "défini" if new_name else "effacé"
+            ui.notify(
+                f"✏️ Nom personnalisé {action}"
+                + (f" : « {new_name} »" if new_name else ""),
+                type="positive",
+            )
+            _draw()
+            if on_change:
+                try:
+                    on_change()
+                except Exception as e:
+                    self.log(f"⚠️ custom_name on_change: {e}")
+
+        def _draw() -> None:
+            outer.clear()
+            with outer:
+                if unit.custom_name:
+                    with ui.element("div").style(
+                        "background:rgba(76,175,80,0.15); color:#2E7D32; "
+                        "padding:2px 8px; border-radius:6px; font-size:12px; "
+                        "font-weight:600; display:inline-flex; align-items:center; "
+                        "gap:4px; border:1px solid rgba(76,175,80,0.35);"
+                    ):
+                        ui.icon("edit_note").style("font-size:14px;")
+                        ui.label(unit.custom_name)
+                else:
+                    ui.label("(pas de nom personnalisé)").classes(
+                        "text-caption text-grey-5"
+                    )
+                ui.button(
+                    icon="edit",
+                    on_click=lambda: self._open_rename_dialog(
+                        current=unit.custom_name,
+                        title="Renommer",
+                        subtitle=Path(unit.main_path).name,
+                        on_save=_save,
+                    ),
+                ).props("flat dense round size=xs color=primary").tooltip(
+                    "Modifier le nom personnalisé"
+                )
+
+        _draw()
+
+    def _render_group_custom_name_row(
+        self,
+        members: list[MediaUnit],
+        on_change: Optional[Callable[[], None]] = None,
+        on_disk: bool = False,
+    ) -> None:
+        """Nom personnalisé partagé pour un groupe (PANO/HYPER/WAYPOINTS).
+
+        Le nom est stocké dans chaque sidecar membre — on affiche le premier
+        non vide et on écrit le même sur tous à la sauvegarde.
+        """
+        if not members:
+            return
+        outer = ui.row().classes("w-full items-center gap-1 q-mt-xs").style(
+            "min-height:20px;"
+        )
+
+        def _current() -> str:
+            for m in members:
+                if m.custom_name:
+                    return m.custom_name
+            return ""
+
+        def _save(new_name: str) -> None:
+            for m in members:
+                m.custom_name = new_name
+                if on_disk:
+                    self._update_sidecar_custom_name(m.main_path, new_name)
+            action = "défini" if new_name else "effacé"
+            ui.notify(
+                f"✏️ Nom du groupe {action}"
+                + (f" : « {new_name} »" if new_name else "")
+                + f" ({len(members)} médias)",
+                type="positive",
+            )
+            _draw()
+            if on_change:
+                try:
+                    on_change()
+                except Exception as e:
+                    self.log(f"⚠️ custom_name on_change: {e}")
+
+        def _draw() -> None:
+            outer.clear()
+            current = _current()
+            with outer:
+                if current:
+                    with ui.element("div").style(
+                        "background:rgba(255,152,0,0.15); color:#E65100; "
+                        "padding:2px 8px; border-radius:6px; font-size:12px; "
+                        "font-weight:600; display:inline-flex; align-items:center; "
+                        "gap:4px; border:1px solid rgba(255,152,0,0.35);"
+                    ):
+                        ui.icon("edit_note").style("font-size:14px;")
+                        ui.label(current)
+                else:
+                    ui.label("(pas de nom de groupe)").classes(
+                        "text-caption text-grey-5"
+                    )
+                first = members[0]
+                subtitle = f"{first.category} · {first.group_subdir or first.capture_date} · {len(members)} médias"
+                ui.button(
+                    icon="edit",
+                    on_click=lambda: self._open_rename_dialog(
+                        current=current,
+                        title="Renommer le groupe",
+                        subtitle=subtitle,
+                        on_save=_save,
+                    ),
+                ).props("flat dense round size=xs color=primary").tooltip(
+                    "Modifier le nom du groupe"
+                )
+
+        _draw()
 
     def _render_tags_row(
         self,
@@ -2995,6 +3225,9 @@ class DJIOrganizatorApp:
                 ).props("flat dense round color=negative").tooltip(
                     f"Envoyer les {len(members)} médias du groupe à la corbeille"
                 )
+
+            # Nom personnalisé du groupe (partagé entre tous les membres)
+            self._render_group_custom_name_row(members, on_change=self._apply_filters)
 
             # Ligne tags — appliqués à TOUS les membres du groupe
             self._render_tags_row(members, on_change=self._apply_filters)
@@ -4087,12 +4320,311 @@ class DJIOrganizatorApp:
             self._calendar_index_cache = None
             self._render_calendar()
 
+    # ── ÉTAPE 8 : Recherche ────────────────────────────────────────────────
+    def _step_search(self) -> None:
+        with ui.tab_panel("search"):
+            with ui.card().classes("w-full"):
+                ui.label("🔍 Recherche dans la destination").classes("text-h6")
+                ui.label(
+                    "Filtre les fichiers déjà organisés par nom, date, tag, "
+                    "catégorie ou drone. La recherche scanne les sidecars "
+                    "`.dji.json` du dossier destination."
+                ).classes("text-caption text-grey-6")
+
+                # Ligne 1 : nom + dates
+                with ui.row().classes("w-full items-center gap-2 q-mt-md"):
+                    self._search_name_input = ui.input(
+                        label="Nom (fichier ou nom personnalisé)",
+                        placeholder="ex. DJI_0212, coucher soleil, vol_test…",
+                    ).props("dense outlined clearable").classes("flex-grow")
+                    self._search_name_input.on(
+                        "keydown.enter", lambda: self._run_search()
+                    )
+                    self._search_date_from = ui.input(
+                        label="Du (YYYY-MM-DD)",
+                    ).props(
+                        "dense outlined clearable mask='####-##-##' fill-mask"
+                    ).classes("min-w-40")
+                    self._search_date_to = ui.input(
+                        label="Au (YYYY-MM-DD)",
+                    ).props(
+                        "dense outlined clearable mask='####-##-##' fill-mask"
+                    ).classes("min-w-40")
+
+                # Ligne 2 : tag + catégorie + drone
+                with ui.row().classes("w-full items-center gap-2 q-mt-sm"):
+                    self._search_tag_sel = ui.select(
+                        options=self._tag_names(),
+                        value=[],
+                        label="Tags (multi)",
+                        multiple=True,
+                    ).props(
+                        "dense outlined options-dense use-chips clearable"
+                    ).classes("min-w-60")
+                    # Mode ET / OU pour combiner plusieurs tags
+                    self._search_tag_mode = ui.toggle(
+                        options={"any": "OU", "all": "ET"},
+                        value="any",
+                    ).props("dense").tooltip(
+                        "OU = au moins un tag / ET = tous les tags"
+                    )
+                    self._search_cat_sel = ui.select(
+                        options=["TOUTES"] + CATEGORIES,
+                        value="TOUTES",
+                        label="Catégorie",
+                    ).props("dense outlined options-dense").classes("min-w-40")
+                    drone_ids = ["TOUS"] + [d["id"] for d in CONFIG.get("drone_mapping", [])]
+                    self._search_drone_sel = ui.select(
+                        options=drone_ids,
+                        value="TOUS",
+                        label="Drone",
+                    ).props("dense outlined options-dense").classes("min-w-40")
+                    ui.space()
+                    ui.button(
+                        "🔍 Rechercher",
+                        icon="search",
+                        on_click=self._run_search,
+                    ).props("unelevated color=primary")
+                    ui.button(
+                        "Réinit.",
+                        icon="restart_alt",
+                        on_click=self._reset_search_filters,
+                    ).props("flat dense color=grey-7")
+
+            # Résultats
+            with ui.card().classes("w-full q-mt-sm"):
+                with ui.row().classes("w-full items-center gap-2"):
+                    ui.icon("list").classes("text-primary")
+                    self._search_count_label = ui.label(
+                        "Utilise les filtres puis clique sur Rechercher."
+                    ).classes("text-body2")
+                self._search_results_container = ui.column().classes(
+                    "w-full gap-2 q-mt-sm"
+                )
+
+    def _refresh_search_filters(self) -> None:
+        """Met à jour les options des selects (tags/drones) selon la config."""
+        try:
+            if self._search_tag_sel is not None:
+                names = self._tag_names()
+                self._search_tag_sel.options = names
+                # Nettoie les tags disparus
+                cur = list(self._search_tag_sel.value or [])
+                self._search_tag_sel.value = [t for t in cur if t in names]
+                self._search_tag_sel.update()
+            if self._search_drone_sel is not None:
+                drone_ids = ["TOUS"] + [d["id"] for d in CONFIG.get("drone_mapping", [])]
+                self._search_drone_sel.options = drone_ids
+                if self._search_drone_sel.value not in drone_ids:
+                    self._search_drone_sel.value = "TOUS"
+                self._search_drone_sel.update()
+        except Exception as e:
+            self.log(f"⚠️ Refresh filtres recherche: {e}")
+
+    def _reset_search_filters(self) -> None:
+        for widget, default in (
+            (self._search_name_input, ""),
+            (self._search_date_from, ""),
+            (self._search_date_to, ""),
+            (self._search_tag_sel, []),
+            (self._search_cat_sel, "TOUTES"),
+            (self._search_drone_sel, "TOUS"),
+        ):
+            if widget is not None:
+                try:
+                    widget.value = default
+                    widget.update()
+                except Exception:
+                    pass
+        if self._search_results_container is not None:
+            self._search_results_container.clear()
+        if self._search_count_label is not None:
+            self._search_count_label.text = "Filtres réinitialisés."
+
+    def _run_search(self) -> None:
+        """Scan la destination + applique les filtres + rend la grille de résultats."""
+        if self._search_results_container is None:
+            return
+        name_q = ((self._search_name_input.value or "") if self._search_name_input else "").strip().lower()
+        date_from = ((self._search_date_from.value or "") if self._search_date_from else "").strip()
+        date_to = ((self._search_date_to.value or "") if self._search_date_to else "").strip()
+        # Multi-tags : liste + mode ET/OU
+        tag_sel_val = self._search_tag_sel.value if self._search_tag_sel else []
+        selected_tags: set[str] = set(tag_sel_val or [])
+        tag_mode = (
+            getattr(self, "_search_tag_mode", None).value
+            if hasattr(self, "_search_tag_mode") and self._search_tag_mode is not None
+            else "any"
+        )
+        cat_f = (self._search_cat_sel.value if self._search_cat_sel else "TOUTES") or "TOUTES"
+        drone_f = (self._search_drone_sel.value if self._search_drone_sel else "TOUS") or "TOUS"
+
+        # Placeholder loading
+        self._search_results_container.clear()
+        with self._search_results_container:
+            loading = ui.column().classes("w-full items-center q-pa-lg")
+            with loading:
+                ui.spinner(size="lg", color="primary")
+                ui.label("Recherche en cours…").classes("text-body2 q-mt-sm")
+
+        def _scan() -> list[tuple[Path, dict]]:
+            """Retourne [(file_path, classification_dict), …] filtré."""
+            dest = Path(self.destination_dir)
+            if not dest.is_dir():
+                return []
+            date_pat = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+            results: list[tuple[Path, dict]] = []
+            hidden_tags = set(self._hidden_tag_names())
+            show_hidden = bool(CONFIG.get("viewer_show_hidden_tags", False))
+
+            # Scan drone → date → catégorie
+            for drone in CONFIG.get("drone_mapping", []):
+                drone_id = drone.get("id", "?")
+                if drone_f != "TOUS" and drone_f != drone_id:
+                    continue
+                folder = drone.get("folder", "")
+                if not folder:
+                    continue
+                drone_dir = dest / folder
+                if not drone_dir.is_dir():
+                    continue
+                for date_dir in drone_dir.iterdir():
+                    if not date_dir.is_dir():
+                        continue
+                    date_str = date_dir.name
+                    if not date_pat.match(date_str):
+                        continue
+                    # Filtre date
+                    if date_from and date_str < date_from:
+                        continue
+                    if date_to and date_str > date_to:
+                        continue
+                    for f in date_dir.rglob("*"):
+                        if not f.is_file() or f.suffix.lower() not in ALL_MEDIA_EXTS:
+                            continue
+                        # Récupère la catégorie via le chemin relatif
+                        try:
+                            rel = f.relative_to(date_dir)
+                            cat = rel.parts[0] if len(rel.parts) > 1 else ""
+                        except ValueError:
+                            cat = ""
+                        if cat_f != "TOUTES" and cat != cat_f:
+                            continue
+                        # Charge sidecar minimal pour tags + custom_name
+                        classification: dict = {}
+                        for sc in (
+                            f.with_suffix(f.suffix + ".dji.json"),
+                            f.with_suffix(".dji.json"),
+                        ):
+                            if sc.exists():
+                                try:
+                                    with open(sc, "r", encoding="utf-8") as fh:
+                                        payload = json.load(fh)
+                                    classification = payload.get("classification", {}) or {}
+                                except Exception:
+                                    classification = {}
+                                break
+                        # Masquage tags cachés
+                        file_tags = set(classification.get("tags") or [])
+                        if hidden_tags and not show_hidden and (file_tags & hidden_tags):
+                            continue
+                        # Filtre tags (multi + mode ET/OU)
+                        if selected_tags:
+                            if tag_mode == "all":
+                                if not selected_tags.issubset(file_tags):
+                                    continue
+                            else:  # any (OU)
+                                if not (selected_tags & file_tags):
+                                    continue
+                        # Filtre nom (fichier ou custom_name)
+                        if name_q:
+                            haystack = (
+                                f.name.lower()
+                                + " "
+                                + str(classification.get("custom_name", "") or "").lower()
+                            )
+                            if name_q not in haystack:
+                                continue
+                        # Injecte le drone_id / date / cat au cas où le sidecar est absent
+                        classification.setdefault("drone_id", drone_id)
+                        classification.setdefault("capture_date", date_str)
+                        classification.setdefault("category", cat or "VIDEO")
+                        results.append((f, classification))
+            # Tri : date desc puis nom
+            results.sort(key=lambda t: (t[1].get("capture_date", ""), t[0].name), reverse=True)
+            return results
+
+        async def _load_and_render() -> None:
+            try:
+                results = await run.io_bound(_scan)
+            except Exception as e:
+                self.log(f"❌ Recherche échouée: {e}")
+                self._search_results_container.clear()
+                with self._search_results_container:
+                    ui.label(f"Erreur : {e}").classes("text-caption text-negative")
+                return
+            # Précalcule les thumbnails hors event-loop
+            try:
+                await run.io_bound(
+                    lambda: [generate_thumbnail(str(fp), size=200) for fp, _ in results]
+                )
+            except Exception:
+                pass
+
+            self._search_results_container.clear()
+            n = len(results)
+            if self._search_count_label is not None:
+                self._search_count_label.text = f"{n} résultat(s)"
+            with self._search_results_container:
+                if not results:
+                    ui.label(
+                        "(aucun résultat — ajuste les filtres et réessaie)"
+                    ).classes("text-caption text-grey-6")
+                    return
+                # Regroupe par (drone, date) pour rendre visuellement structuré
+                grouped: dict[tuple[str, str], list[tuple[Path, dict]]] = {}
+                for fp, cls in results:
+                    key = (cls.get("drone_id", "?"), cls.get("capture_date", ""))
+                    grouped.setdefault(key, []).append((fp, cls))
+
+                for (drone_id, date_str), items in grouped.items():
+                    with ui.row().classes(
+                        "w-full items-center gap-2 q-mt-sm q-pa-xs"
+                    ).style(
+                        f"background:{self._drone_hex(drone_id)}18; "
+                        f"border-left:3px solid {self._drone_hex(drone_id)}; "
+                        f"border-radius:6px;"
+                    ):
+                        ui.icon("flight").style(f"color:{self._drone_hex(drone_id)};")
+                        ui.label(f"{drone_id} · {date_str}").classes(
+                            "text-subtitle2"
+                        )
+                        ui.badge(f"{len(items)}", color="primary")
+                    # Regroupe PANO/HYPER/WAYPOINTS
+                    disk_items = self._partition_disk_files(
+                        [fp for fp, _ in items]
+                    )
+                    with ui.grid(columns=4).classes("w-full gap-2"):
+                        for it in disk_items:
+                            if it["kind"] == "single":
+                                self._render_viewer_media_card(it["path"])
+                            else:
+                                self._render_viewer_group_card(
+                                    it["category"],
+                                    it["group_subdir"],
+                                    it["files"],
+                                )
+
+        background_tasks.create(_load_and_render(), name="search_run")
+
     def _on_tab_change(self, e) -> None:
         # Rafraîchit automatiquement le contenu selon l'onglet actif
         if e.value == "viewer":
             self._render_viewer()
         elif e.value == "drones":
             self._refresh_drones_panel()
+        elif e.value == "search":
+            self._refresh_search_filters()
 
     def _render_viewer(self) -> None:
         if self._viewer_container is None:
@@ -4193,17 +4725,25 @@ class DJIOrganizatorApp:
 
         results_col = ui.column().classes("w-full gap-2")
 
-        def _scan_dates() -> list[tuple[str, int]]:
-            dates: list[tuple[str, int]] = []
+        def _scan_dates() -> list[tuple[str, int, dict[str, int]]]:
+            dates: list[tuple[str, int, dict[str, int]]] = []
             for p in sorted(folder.iterdir(), reverse=True):
                 if not p.is_dir():
                     continue
-                n_media = sum(
-                    1 for f in p.rglob("*")
-                    if f.is_file() and f.suffix.lower() in ALL_MEDIA_EXTS
-                )
+                n_media = 0
+                tag_counts: dict[str, int] = {}
+                for f in p.rglob("*"):
+                    if not f.is_file():
+                        continue
+                    if f.suffix.lower() in ALL_MEDIA_EXTS:
+                        n_media += 1
+                        try:
+                            for t in self._read_sidecar_tags(f):
+                                tag_counts[t] = tag_counts.get(t, 0) + 1
+                        except Exception:
+                            pass
                 if n_media > 0:
-                    dates.append((p.name, n_media))
+                    dates.append((p.name, n_media, tag_counts))
             return dates
 
         async def _load() -> None:
@@ -4224,8 +4764,11 @@ class DJIOrganizatorApp:
                 return
 
             with results_col:
+                # Tags cachés à filtrer sauf si l'utilisateur les affiche
+                show_hidden = bool(CONFIG.get("viewer_show_hidden_tags", False))
+                hidden_names = self._hidden_tag_names() if not show_hidden else set()
                 with ui.grid(columns=4).classes("w-full gap-2"):
-                    for date_str, n in dates:
+                    for date_str, n, tag_counts in dates:
                         with ui.card().classes("w-full cursor-pointer hover:shadow-md").on(
                             "click", lambda d=date_str: self._viewer_goto("media", date=d)
                         ):
@@ -4234,6 +4777,35 @@ class DJIOrganizatorApp:
                                 with ui.column().classes("gap-0"):
                                     ui.label(date_str).classes("text-body1 font-bold")
                                     ui.label(f"{n} média(s)").classes("text-caption text-grey-7")
+                            # Résumé des tags (chips triés par occurrence décroissante),
+                            # sans les tags marqués "à masquer" si l'option est désactivée.
+                            visible_tag_counts = {
+                                k: v for k, v in tag_counts.items()
+                                if k not in hidden_names
+                            }
+                            if visible_tag_counts:
+                                with ui.row().classes(
+                                    "w-full items-center gap-1 q-mt-xs"
+                                ).style("flex-wrap:wrap;"):
+                                    sorted_tags = sorted(
+                                        visible_tag_counts.items(),
+                                        key=lambda kv: (-kv[1], kv[0]),
+                                    )
+                                    for tag_name, count in sorted_tags:
+                                        hex_c = self._tag_hex(tag_name)
+                                        icon = self._tag_icon(tag_name)
+                                        with ui.element("div").style(
+                                            f"background:{hex_c}22; color:{hex_c}; "
+                                            f"padding:1px 6px; border-radius:8px; "
+                                            f"font-size:10px; font-weight:600; "
+                                            f"display:inline-flex; align-items:center; "
+                                            f"gap:3px; border:1px solid {hex_c};"
+                                        ).tooltip(f"{tag_name} — {count} média(s)"):
+                                            ui.label(icon).style("font-size:10px;")
+                                            ui.label(tag_name)
+                                            ui.label(f"×{count}").style(
+                                                "opacity:0.75; margin-left:2px;"
+                                            )
 
         background_tasks.create(_load(), name=f"viewer_dates_{drone.get('id', '')}")
 
@@ -4354,24 +4926,269 @@ class DJIOrganizatorApp:
             with media_col:
                 for cat in sorted(by_category.keys()):
                     files = sorted(by_category[cat])
-                    title = f"📁 {cat} ({len(files)})" if cat else f"📼 Racine ({len(files)})"
+                    # Regroupe PANO/HYPER/WAYPOINTS par sous-dossier
+                    items = self._partition_disk_files(files)
+                    title = f"📁 {cat} ({len(items)})" if cat else f"📼 Racine ({len(items)})"
                     ui.label(title).classes("text-subtitle1 mt-2")
                     with ui.grid(columns=4).classes("w-full gap-2"):
-                        for f in files:
-                            self._render_viewer_media_card(f, precomputed_thumb=thumbs.get(str(f)))
+                        for item in items:
+                            if item["kind"] == "single":
+                                fp = item["path"]
+                                self._render_viewer_media_card(
+                                    fp, precomputed_thumb=thumbs.get(str(fp))
+                                )
+                            else:
+                                self._render_viewer_group_card(
+                                    item["category"],
+                                    item["group_subdir"],
+                                    item["files"],
+                                )
 
         background_tasks.create(_load_and_render(), name=f"viewer_media_{date_str}")
+
+    # ── Regroupement disk-side (PANO/HYPER/WAYPOINTS/REALITY_SCAN) ────────
+    GROUPED_CATEGORIES_DISK = ("PANORAMA", "HYPERLAPSE", "WAYPOINTS", "REALITY_SCAN")
+
+    def _disk_group_key(self, f: Path) -> Optional[tuple[str, str]]:
+        """Si le fichier est dans `.../<CATEGORY>/<subdir>/file`, retourne
+        `(category, subdir)`. Sinon `None` (fichier individuel)."""
+        parts = f.parts
+        for cat in self.GROUPED_CATEGORIES_DISK:
+            try:
+                idx = parts.index(cat)
+            except ValueError:
+                continue
+            # cat = parts[idx] ; il faut parts[idx+1] = group_subdir puis file plus bas
+            if idx + 2 < len(parts):
+                return (cat, parts[idx + 1])
+        return None
+
+    def _partition_disk_files(
+        self, files: list[Path]
+    ) -> list[dict[str, Any]]:
+        """Convertit une liste plate de fichiers en items :
+        - `{"kind": "single", "path": Path}` pour un média isolé
+        - `{"kind": "group", "category": str, "group_subdir": str,
+             "files": list[Path]}` pour PANO/HYPER/WAYPOINTS regroupés
+        Préserve globalement l'ordre d'apparition.
+        """
+        items: list[dict[str, Any]] = []
+        groups_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for f in files:
+            key = self._disk_group_key(f)
+            if key is None:
+                items.append({"kind": "single", "path": f})
+                continue
+            grp = groups_by_key.get(key)
+            if grp is None:
+                grp = {
+                    "kind": "group",
+                    "category": key[0],
+                    "group_subdir": key[1],
+                    "files": [f],
+                }
+                groups_by_key[key] = grp
+                items.append(grp)
+            else:
+                grp["files"].append(f)
+        # Trie les fichiers de chaque groupe pour un rendu stable
+        for grp in groups_by_key.values():
+            grp["files"].sort()
+        return items
+
+    def _render_viewer_group_card(
+        self,
+        category: str,
+        group_subdir: str,
+        files: list[Path],
+    ) -> None:
+        """Carte de groupe côté viewer (PANO/HYPER/WAYPOINTS déjà organisés)."""
+        if not files:
+            return
+        first = files[0]
+        # Couleurs par catégorie
+        cat_hex = {
+            "PANORAMA": "#FB8C00",
+            "HYPERLAPSE": "#8E24AA",
+            "WAYPOINTS": "#00897B",
+            "REALITY_SCAN": "#7C4DFF",
+        }.get(category, "#FB8C00")
+        cat_icon = {
+            "PANORAMA": "panorama",
+            "HYPERLAPSE": "timelapse",
+            "WAYPOINTS": "route",
+            "REALITY_SCAN": "view_in_ar",
+        }.get(category, "photo_library")
+
+        card = ui.card().classes("w-full hover:shadow-lg").style(
+            f"border:2px solid {cat_hex};"
+        )
+        # Holder pour le redraw de la ligne de tags du groupe — assigné
+        # après création (chip line rendue en bas de carte).
+        group_tag_redraw_holder: dict[str, Callable[[], None]] = {}
+
+        def _open_group_from_card() -> None:
+            self._open_disk_group_dialog(
+                category, group_subdir, files,
+                on_close=group_tag_redraw_holder.get("draw"),
+            )
+
+        with card:
+            thumb_zone = ui.element("div").classes("relative w-full cursor-pointer")
+            thumb_zone.on("click", lambda: _open_group_from_card())
+            thumb_zone.tooltip(
+                f"Cliquer pour voir toutes les {len(files)} vignettes du groupe"
+            )
+            with thumb_zone:
+                thumb = generate_thumbnail(str(first), size=200)
+                if thumb:
+                    ui.image(image_to_data_uri(thumb)).classes(
+                        "w-full h-28 object-cover rounded"
+                    )
+                else:
+                    with ui.element("div").classes(
+                        "w-full h-28 flex items-center justify-center bg-grey-3 rounded"
+                    ):
+                        ui.icon(cat_icon).classes("text-4xl text-grey-6")
+                # Badge nombre
+                with ui.element("div").classes(
+                    "absolute top-1 right-1 text-white text-caption px-2 py-1 rounded-lg"
+                ).style(f"background:{cat_hex}; font-weight:700;"):
+                    ui.label(f"×{len(files)}")
+                # Étiquette catégorie
+                with ui.element("div").classes(
+                    "absolute bottom-1 left-1 bg-black bg-opacity-70 text-white text-caption px-2 py-1 rounded"
+                ):
+                    with ui.row().classes("items-center gap-1 no-wrap"):
+                        ui.icon(cat_icon).classes("text-white text-sm")
+                        ui.label(category)
+                # Overlay checkbox multi-sélection (sélectionne TOUS les fichiers du groupe)
+                paths_str = [str(f) for f in files]
+                all_selected = all(
+                    p in self._selected_viewer_files for p in paths_str
+                )
+                sel_overlay = ui.element("div").classes(
+                    "sel-overlay" + (" sel-active" if all_selected else "")
+                )
+                sel_overlay.on("click.stop", lambda: None)
+                with sel_overlay:
+                    cb = ui.checkbox(
+                        value=all_selected,
+                        on_change=lambda e, ps=paths_str:
+                            self._toggle_viewer_selection(ps, bool(e.value)),
+                    ).classes("sel-checkbox").props("dense size=xs color=red-4 dark")
+                    cb.tooltip(
+                        f"Sélectionner les {len(files)} fichiers du groupe"
+                    )
+            ui.label(f"{category} · {group_subdir}").classes(
+                "text-body2 truncate"
+            ).tooltip(str(first.parent))
+            try:
+                total = sum(f.stat().st_size for f in files)
+                ui.label(
+                    f"{len(files)} fichiers · {human_size(total)}"
+                ).classes("text-caption text-grey-7")
+            except OSError:
+                pass
+            # Tags appliqués au groupe entier (intersection affichée)
+            # — le redraw est mémorisé pour être appelé à la fermeture du dialog du groupe.
+            group_tag_redraw_holder["draw"] = self._render_viewer_group_tags(files)
+
+    def _open_disk_group_dialog(
+        self,
+        category: str,
+        group_subdir: str,
+        files: list[Path],
+        on_close: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Dialog plein écran affichant toutes les vignettes d'un groupe disk.
+
+        `on_close` : callback optionnel appelé lorsque le dialog se ferme
+        (utile pour rafraîchir la carte du groupe si les tags des membres
+        ont été modifiés).
+        """
+        try:
+            if not files:
+                return
+            first = files[0]
+            cat_hex = {
+                "PANORAMA": "#FB8C00",
+                "HYPERLAPSE": "#8E24AA",
+                "WAYPOINTS": "#00897B",
+                "REALITY_SCAN": "#7C4DFF",
+            }.get(category, "#FB8C00")
+            cat_icon = {
+                "PANORAMA": "panorama",
+                "HYPERLAPSE": "timelapse",
+                "WAYPOINTS": "route",
+                "REALITY_SCAN": "view_in_ar",
+            }.get(category, "photo_library")
+
+            dlg = ui.dialog().props("maximized")
+            with dlg:
+                with ui.card().classes("w-full h-full no-shadow column no-wrap"):
+                    with ui.row().classes(
+                        "w-full items-center gap-2 q-pa-sm text-white"
+                    ).style(f"background:{cat_hex};"):
+                        ui.icon(cat_icon)
+                        ui.label(f"{category} — {group_subdir}").classes(
+                            "text-h6 flex-grow"
+                        )
+                        ui.badge(f"{len(files)} médias", color="white text-black")
+                        try:
+                            total = sum(f.stat().st_size for f in files)
+                            ui.badge(
+                                human_size(total),
+                                color="white text-black",
+                            )
+                        except OSError:
+                            pass
+                        ui.button(icon="close", on_click=dlg.close).props(
+                            "flat round color=white"
+                        )
+
+                    with ui.scroll_area().classes("w-full col"):
+                        with ui.grid(columns=6).classes("w-full gap-2 q-pa-sm"):
+                            for f in files:
+                                self._render_viewer_media_card(f)
+            if on_close is not None:
+                def _fire_group_on_close(e) -> None:
+                    if not e.value:
+                        try:
+                            on_close()
+                        except Exception:
+                            pass
+                dlg.on_value_change(_fire_group_on_close)
+            dlg.open()
+        except Exception as e:
+            import traceback
+            self.log(f"❌ Ouverture groupe disque: {e}")
+            self.log(traceback.format_exc())
+            ui.notify(f"Erreur : {e}", type="negative")
 
     def _render_viewer_media_card(self, file_path: Path, precomputed_thumb: Optional[str] = None) -> None:
         is_video = file_path.suffix.lower() in VIDEO_EXTS
         fp_str = str(file_path)
         card = ui.card().classes("w-full hover:shadow-lg")
+        # Références aux redraws des chips (renseignées plus bas) pour
+        # rafraîchir la carte quand le dialog d'aperçu se ferme.
+        redraws: dict[str, Callable[[], None]] = {}
+
+        def _refresh_card() -> None:
+            for fn in redraws.values():
+                try:
+                    fn()
+                except Exception:
+                    pass
+
         with card:
             thumb_zone = ui.element("div").classes("relative w-full cursor-pointer")
             thumb_zone.on(
                 "click",
                 lambda p=file_path: self._open_preview_from_disk(
-                    p, on_deleted=self._on_viewer_file_deleted
+                    p,
+                    on_deleted=self._on_viewer_file_deleted,
+                    on_close=_refresh_card,
                 ),
             )
             with thumb_zone:
@@ -4426,11 +5243,71 @@ class DJIOrganizatorApp:
                 ui.label(human_size(size)).classes("text-caption text-grey-7")
             except OSError:
                 pass
+            # Nom personnalisé (lit et persiste directement le sidecar)
+            redraws["name"] = self._render_viewer_thumb_custom_name(file_path)
             # Ligne tags compacte (lit et persiste directement le sidecar)
-            self._render_viewer_thumb_tags(file_path)
+            redraws["tags"] = self._render_viewer_thumb_tags(file_path)
 
-    def _render_viewer_thumb_tags(self, file_path: Path) -> None:
-        """Rangée de tags compacte auto-rafraîchissante sous la vignette du viewer."""
+    def _render_viewer_thumb_custom_name(self, file_path: Path) -> Callable[[], None]:
+        """Chip nom personnalisé auto-rafraîchissante sous la vignette du viewer.
+
+        Retourne le callable `_draw` pour permettre un rafraîchissement externe.
+        """
+        outer = ui.row().classes("w-full items-center gap-1 q-mt-xs").style(
+            "flex-wrap:wrap; min-height:18px;"
+        )
+
+        def _draw() -> None:
+            outer.clear()
+            current = self._read_sidecar_custom_name(file_path)
+            with outer:
+                if current:
+                    with ui.element("div").style(
+                        "background:rgba(76,175,80,0.15); color:#2E7D32; "
+                        "padding:1px 6px; border-radius:6px; font-size:10px; "
+                        "font-weight:600; display:inline-flex; align-items:center; "
+                        "gap:3px; border:1px solid rgba(76,175,80,0.35); "
+                        "max-width:100%;"
+                    ):
+                        ui.icon("edit_note").style("font-size:11px;")
+                        ui.label(current).classes("truncate")
+
+                def _save(new_name: str) -> None:
+                    if self._update_sidecar_custom_name(str(file_path), new_name):
+                        action = "défini" if new_name else "effacé"
+                        ui.notify(
+                            f"✏️ Nom {action}"
+                            + (f" : « {new_name} »" if new_name else ""),
+                            type="positive",
+                        )
+                        _draw()
+                    else:
+                        ui.notify(
+                            "⚠️ Sidecar introuvable — impossible d'enregistrer",
+                            type="warning",
+                        )
+
+                ui.button(
+                    icon="edit",
+                    on_click=lambda: self._open_rename_dialog(
+                        current=current,
+                        title="Renommer",
+                        subtitle=file_path.name,
+                        on_save=_save,
+                    ),
+                ).props("flat dense round size=xs color=primary").tooltip(
+                    "Modifier le nom personnalisé"
+                )
+
+        _draw()
+        return _draw
+
+    def _render_viewer_thumb_tags(self, file_path: Path) -> Callable[[], None]:
+        """Rangée de tags compacte auto-rafraîchissante sous la vignette du viewer.
+
+        Retourne le callable `_draw` pour permettre un rafraîchissement externe
+        (ex : à la fermeture d'un dialog d'aperçu qui a modifié les tags).
+        """
         outer = ui.row().classes("w-full items-center gap-1 q-mt-xs").style(
             "flex-wrap:wrap; min-height:20px;"
         )
@@ -4517,10 +5394,203 @@ class DJIOrganizatorApp:
                                         )
 
         _draw()
+        return _draw
+
+    def _render_viewer_group_tags(self, files: list[Path]) -> Callable[[], None]:
+        """Rangée de tags compacte pour un GROUPE disk (PANO/HYPER/WAYPOINTS/REALITY_SCAN).
+
+        Les tags s'appliquent à *tous* les fichiers du groupe. Les chips affichées
+        représentent l'intersection (tags communs à tous les membres). Le bouton
+        « + » ajoute le tag choisi à tous les fichiers du groupe ; le « × » sur
+        une chip le retire de tous.
+
+        Retourne le callable `_draw` pour permettre un rafraîchissement externe.
+        """
+        outer = ui.row().classes("w-full items-center gap-1 q-mt-xs").style(
+            "flex-wrap:wrap; min-height:20px;"
+        )
+
+        def _common_tags() -> set[str]:
+            per_file = [set(self._read_sidecar_tags(f)) for f in files]
+            if not per_file:
+                return set()
+            common = set(per_file[0])
+            for s in per_file[1:]:
+                common &= s
+            return common
+
+        def _apply_add(tag_name: str) -> int:
+            n_ok = 0
+            for f in files:
+                cur = set(self._read_sidecar_tags(f))
+                if tag_name in cur:
+                    continue
+                new_tags = sorted(cur | {tag_name})
+                if self._update_sidecar_tags(f, new_tags):
+                    n_ok += 1
+            return n_ok
+
+        def _apply_remove(tag_name: str) -> int:
+            n_ok = 0
+            for f in files:
+                cur = set(self._read_sidecar_tags(f))
+                if tag_name not in cur:
+                    continue
+                new_tags = sorted(cur - {tag_name})
+                if self._update_sidecar_tags(f, new_tags):
+                    n_ok += 1
+            return n_ok
+
+        def _draw() -> None:
+            outer.clear()
+            current = _common_tags()
+            hidden = set(self._hidden_tag_names())
+            with outer:
+                for tag_name in sorted(current):
+                    hex_c = self._tag_hex(tag_name)
+                    icon = self._tag_icon(tag_name)
+                    chip = ui.element("div").style(
+                        f"background:{hex_c}22; color:{hex_c}; "
+                        f"padding:1px 5px; border-radius:8px; "
+                        f"font-size:10px; font-weight:600; "
+                        f"display:inline-flex; align-items:center; gap:3px; "
+                        f"border:1px solid {hex_c};"
+                    )
+                    with chip:
+                        ui.label(icon).style("font-size:10px;")
+                        ui.label(tag_name)
+
+                        def _remove(n=tag_name) -> None:
+                            n_ok = _apply_remove(n)
+                            if n_ok:
+                                ui.notify(
+                                    f"— {n} retiré de {n_ok} fichier(s)",
+                                    type="info",
+                                )
+                                self._calendar_index_cache = None
+                                _draw()
+
+                        ui.button(
+                            icon="close",
+                            on_click=_remove,
+                        ).props("flat dense round size=xs").style(
+                            f"color:{hex_c}; margin:-4px -6px -4px 0;"
+                        ).tooltip(f"Retirer « {tag_name} » des {len(files)} fichiers")
+
+                available = [n for n in self._tag_names() if n not in current]
+                if available:
+                    add_btn = ui.button(icon="add").props(
+                        "flat dense round size=xs color=primary"
+                    ).tooltip(f"Ajouter un tag aux {len(files)} fichiers du groupe")
+                    with add_btn:
+                        with ui.menu() as menu:
+                            for name in sorted(available):
+                                hex_c = self._tag_hex(name)
+                                icon = self._tag_icon(name)
+
+                                def _add(n=name, m=menu) -> None:
+                                    n_ok = _apply_add(n)
+                                    if n_ok:
+                                        ui.notify(
+                                            f"+ {n} appliqué à {n_ok} fichier(s)",
+                                            type="positive",
+                                        )
+                                        self._calendar_index_cache = None
+                                        if (
+                                            n in hidden
+                                            and not CONFIG.get(
+                                                "viewer_show_hidden_tags", False
+                                            )
+                                        ):
+                                            try:
+                                                self._render_viewer()
+                                            except Exception:
+                                                _draw()
+                                        else:
+                                            _draw()
+                                    m.close()
+
+                                with ui.menu_item(on_click=_add):
+                                    with ui.row().classes("items-center gap-2"):
+                                        ui.label(icon).style("font-size:14px;")
+                                        ui.label(name)
+                                        if name in hidden:
+                                            ui.icon("visibility_off").classes(
+                                                "text-grey-6 text-sm"
+                                            ).tooltip("Tag caché")
+                                        ui.element("div").style(
+                                            f"width:10px; height:10px; border-radius:50%; "
+                                            f"background:{hex_c};"
+                                        )
+
+        _draw()
+        return _draw
 
     # ═══════════════════════════════════════════════════════════════════════
     # CALENDRIER (onglet interne du visualiseur)
     # ═══════════════════════════════════════════════════════════════════════
+    def _build_calendar_tag_index(
+        self,
+    ) -> dict[str, dict[str, dict[str, int]]]:
+        """Retourne `{YYYY-MM-DD: {drone_id: {tag_name: count}}}` en lisant les sidecars.
+
+        Un peu plus coûteux que `_build_calendar_index` car il ouvre chaque `.dji.json`
+        présent. Cache local `self._calendar_tag_index_cache`.
+
+        Les fichiers avec un tag marqué « à masquer » (ex : nsfw) sont exclus,
+        sauf si l'utilisateur a activé `viewer_show_hidden_tags`.
+        """
+        if self._calendar_tag_index_cache is not None:
+            return self._calendar_tag_index_cache
+
+        index: dict[str, dict[str, dict[str, int]]] = {}
+        dest = Path(self.destination_dir)
+        if not dest.is_dir():
+            self._calendar_tag_index_cache = index
+            return index
+
+        hidden_tags = set(self._hidden_tag_names())
+        show_hidden = bool(CONFIG.get("viewer_show_hidden_tags", False))
+        filter_hidden = bool(hidden_tags and not show_hidden)
+
+        date_pat = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+        for drone in CONFIG.get("drone_mapping", []):
+            drone_id = drone.get("id", "?")
+            folder = drone.get("folder", "")
+            if not folder:
+                continue
+            drone_dir = dest / folder
+            if not drone_dir.is_dir():
+                continue
+            for date_dir in drone_dir.iterdir():
+                if not date_dir.is_dir():
+                    continue
+                date_str = date_dir.name
+                if not date_pat.match(date_str):
+                    continue
+                for f in date_dir.rglob("*"):
+                    if not f.is_file():
+                        continue
+                    if f.suffix.lower() not in ALL_MEDIA_EXTS:
+                        continue
+                    try:
+                        file_tags = set(self._read_sidecar_tags(f))
+                    except Exception:
+                        continue
+                    if filter_hidden and (file_tags & hidden_tags):
+                        continue
+                    # Tags visibles (hors tags cachés) pour compter
+                    visible = file_tags - hidden_tags if filter_hidden else file_tags
+                    if not visible:
+                        continue
+                    drones = index.setdefault(date_str, {})
+                    tag_counts = drones.setdefault(drone_id, {})
+                    for t in visible:
+                        tag_counts[t] = tag_counts.get(t, 0) + 1
+
+        self._calendar_tag_index_cache = index
+        return index
+
     def _build_calendar_index(self) -> dict[str, dict[str, dict[str, int]]]:
         """Retourne `{YYYY-MM-DD: {drone_id: {category: count}}}` en scannant la destination.
 
@@ -4636,18 +5706,35 @@ class DJIOrganizatorApp:
             for d in CONFIG.get("drone_mapping", []):
                 drone_opts[d.get("id", "?")] = d.get("label", d.get("id", "?"))
             cat_opts = {"TOUTES": "Toutes catégories", **{c: c for c in CATEGORIES}}
+            hidden_names = self._hidden_tag_names()
+            show_hidden = bool(CONFIG.get("viewer_show_hidden_tags", False))
+            all_tag_names = [
+                n for n in self._tag_names()
+                if show_hidden or n not in hidden_names
+            ]
+            tag_opts = {n: n for n in sorted(all_tag_names)}
 
             # Normalise si drone/cat n'existe plus dans les options
             if self._calendar_state["drone_filter"] not in drone_opts:
                 self._calendar_state["drone_filter"] = "TOUS"
             if self._calendar_state["cat_filter"] not in cat_opts:
                 self._calendar_state["cat_filter"] = "TOUTES"
+            if self._calendar_state.get("group_mode") not in ("cat", "tag"):
+                self._calendar_state["group_mode"] = "cat"
+            # Nettoie les tags disparus / masqués
+            self._calendar_state["tag_filter"] = [
+                t for t in (self._calendar_state.get("tag_filter") or [])
+                if t in tag_opts
+            ]
+            group_mode = self._calendar_state["group_mode"]
 
             with ui.element("div").style(
                 "background:rgba(255,255,255,0.02); border-radius:10px; "
                 "padding:8px 12px; border:1px solid rgba(255,255,255,0.06);"
             ).classes("w-full"):
-                with ui.row().classes("w-full items-center gap-3 no-wrap"):
+                with ui.row().classes("w-full items-center gap-3").style(
+                    "flex-wrap:wrap;"
+                ):
                     ui.icon("filter_list").classes("text-blue-4")
                     ui.label("Filtres :").classes("text-caption text-grey-5")
                     ui.select(
@@ -4655,17 +5742,44 @@ class DJIOrganizatorApp:
                         value=self._calendar_state["drone_filter"],
                         on_change=self._on_calendar_drone_filter,
                     ).props("dense options-dense outlined color=blue-4").classes("min-w-40")
-                    ui.select(
-                        options=cat_opts,
-                        value=self._calendar_state["cat_filter"],
-                        on_change=self._on_calendar_cat_filter,
-                    ).props("dense options-dense outlined color=blue-4").classes("min-w-40")
+                    # Toggle de regroupement Cat / Tag
+                    ui.label("Vue :").classes("text-caption text-grey-5 q-ml-md")
+                    ui.toggle(
+                        options={"cat": "Par catégorie", "tag": "Par tag"},
+                        value=group_mode,
+                        on_change=self._on_calendar_group_mode,
+                    ).props("dense color=blue-4")
+                    if group_mode == "cat":
+                        ui.select(
+                            options=cat_opts,
+                            value=self._calendar_state["cat_filter"],
+                            on_change=self._on_calendar_cat_filter,
+                        ).props(
+                            "dense options-dense outlined color=blue-4"
+                        ).classes("min-w-40")
+                    # Multi-sélecteur de tags (agit comme filtre en mode "cat"
+                    # et comme filtre + choix de chips en mode "tag")
+                    if tag_opts:
+                        ui.select(
+                            options=tag_opts,
+                            value=self._calendar_state["tag_filter"],
+                            multiple=True,
+                            clearable=True,
+                            label="Tags",
+                            on_change=self._on_calendar_tag_filter,
+                        ).props(
+                            "dense options-dense outlined color=blue-4 use-chips"
+                        ).classes("min-w-56")
                     ui.space()
                     active_filters = []
                     if self._calendar_state["drone_filter"] != "TOUS":
                         active_filters.append(f"drone={self._calendar_state['drone_filter']}")
-                    if self._calendar_state["cat_filter"] != "TOUTES":
+                    if group_mode == "cat" and self._calendar_state["cat_filter"] != "TOUTES":
                         active_filters.append(f"cat={self._calendar_state['cat_filter']}")
+                    if self._calendar_state["tag_filter"]:
+                        active_filters.append(
+                            f"tags={','.join(self._calendar_state['tag_filter'])}"
+                        )
                     if active_filters:
                         ui.button(
                             "Réinitialiser",
@@ -4687,7 +5801,18 @@ class DJIOrganizatorApp:
 
             async def _load() -> None:
                 try:
-                    idx = await run.io_bound(self._build_calendar_index)
+                    if group_mode == "tag":
+                        # Cache dédié tag_index : plus coûteux mais mis en cache
+                        idx = await run.io_bound(self._build_calendar_tag_index)
+                    else:
+                        idx = await run.io_bound(self._build_calendar_index)
+                        # Si un filtre de tags est actif en mode catégorie, on doit
+                        # aussi charger l'index tag pour restreindre les compteurs.
+                        if self._calendar_state.get("tag_filter"):
+                            tag_idx = await run.io_bound(
+                                self._build_calendar_tag_index
+                            )
+                            idx = self._intersect_cat_with_tags(idx, tag_idx)
                 except Exception as e:
                     self.log(f"❌ Calendar index build failed: {e}")
                     loading_col.clear()
@@ -4696,31 +5821,69 @@ class DJIOrganizatorApp:
                     return
 
                 loading_col.delete()
-                # Applique les filtres drone/catégorie
+                # Applique les filtres drone/catégorie/tag
                 filtered = self._apply_calendar_filters(idx)
                 with body:
-                    self._render_calendar_month_grid(filtered, y, m)
+                    self._render_calendar_month_grid(filtered, y, m, group_mode)
 
             background_tasks.create(_load(), name=f"calendar_load_{y}_{m}")
+
+    def _intersect_cat_with_tags(
+        self,
+        cat_index: dict[str, dict[str, dict[str, int]]],
+        tag_index: dict[str, dict[str, dict[str, int]]],
+    ) -> dict[str, dict[str, dict[str, int]]]:
+        """Ne conserve dans `cat_index` que les jours/drones qui ont au moins
+        un des tags sélectionnés dans `tag_filter`. Le nombre affiché reste
+        celui de la catégorie (approximation acceptable — l'utilisateur veut
+        surtout voir les jours pertinents).
+        """
+        wanted = set(self._calendar_state.get("tag_filter") or [])
+        if not wanted:
+            return cat_index
+        out: dict[str, dict[str, dict[str, int]]] = {}
+        for date_str, drones in cat_index.items():
+            tag_drones = tag_index.get(date_str, {})
+            new_drones: dict[str, dict[str, int]] = {}
+            for drone_id, cats in drones.items():
+                dtags = set(tag_drones.get(drone_id, {}).keys())
+                if wanted & dtags:
+                    new_drones[drone_id] = cats
+            if new_drones:
+                out[date_str] = new_drones
+        return out
 
     def _apply_calendar_filters(
         self, index: dict[str, dict[str, dict[str, int]]]
     ) -> dict[str, dict[str, dict[str, int]]]:
-        """Retourne une copie de l'index filtrée par drone et catégorie."""
+        """Retourne une copie de l'index filtrée par drone / catégorie / tags.
+
+        En mode `group_mode == "cat"`, les clés internes sont des catégories
+        et `cat_filter` s'applique. En mode `"tag"`, les clés sont des tags
+        et `tag_filter` (multi) restreint les chips affichées.
+        """
+        group_mode = self._calendar_state.get("group_mode", "cat")
         drone_f = self._calendar_state.get("drone_filter", "TOUS")
         cat_f = self._calendar_state.get("cat_filter", "TOUTES")
-        if drone_f == "TOUS" and cat_f == "TOUTES":
-            return index
+        tag_f = set(self._calendar_state.get("tag_filter") or [])
         out: dict[str, dict[str, dict[str, int]]] = {}
         for date_str, drones in index.items():
             new_drones: dict[str, dict[str, int]] = {}
-            for drone_id, cats in drones.items():
+            for drone_id, entries in drones.items():
                 if drone_f != "TOUS" and drone_id != drone_f:
                     continue
-                new_cats = {c: n for c, n in cats.items()
-                            if cat_f == "TOUTES" or c == cat_f}
-                if new_cats:
-                    new_drones[drone_id] = new_cats
+                if group_mode == "tag":
+                    new_entries = {
+                        t: n for t, n in entries.items()
+                        if (not tag_f) or t in tag_f
+                    }
+                else:
+                    new_entries = {
+                        c: n for c, n in entries.items()
+                        if cat_f == "TOUTES" or c == cat_f
+                    }
+                if new_entries:
+                    new_drones[drone_id] = new_entries
             if new_drones:
                 out[date_str] = new_drones
         return out
@@ -4733,9 +5896,18 @@ class DJIOrganizatorApp:
         self._calendar_state["cat_filter"] = e.value
         self._render_calendar()
 
+    def _on_calendar_group_mode(self, e) -> None:
+        self._calendar_state["group_mode"] = e.value or "cat"
+        self._render_calendar()
+
+    def _on_calendar_tag_filter(self, e) -> None:
+        self._calendar_state["tag_filter"] = list(e.value or [])
+        self._render_calendar()
+
     def _on_calendar_filters_reset(self) -> None:
         self._calendar_state["drone_filter"] = "TOUS"
         self._calendar_state["cat_filter"] = "TOUTES"
+        self._calendar_state["tag_filter"] = []
         self._render_calendar()
 
     def _calendar_prev_month(self) -> None:
@@ -4768,6 +5940,7 @@ class DJIOrganizatorApp:
 
     def _calendar_refresh(self) -> None:
         self._calendar_index_cache = None
+        self._calendar_tag_index_cache = None
         self._render_calendar()
 
     _CAT_ABBREV = {
@@ -4814,8 +5987,12 @@ class DJIOrganizatorApp:
         index: dict[str, dict[str, dict[str, int]]],
         year: int,
         month: int,
+        group_mode: str = "cat",
     ) -> None:
-        """Dessine une grille 7×N pour le mois donné avec les compteurs par cellule."""
+        """Dessine une grille 7×N pour le mois donné avec les compteurs par cellule.
+
+        `group_mode` : "cat" (chips = catégories) ou "tag" (chips = tags).
+        """
         cal = calendar.Calendar(firstweekday=0)  # lundi
         weeks = cal.monthdatescalendar(year, month)
 
@@ -4840,22 +6017,51 @@ class DJIOrganizatorApp:
                     date_str = day.strftime("%Y-%m-%d")
                     day_data = index.get(date_str, {})
                     self._render_calendar_day_cell(
-                        day, date_str, day_data, is_current_month, is_today
+                        day, date_str, day_data,
+                        is_current_month, is_today, group_mode,
                     )
 
-        # Légende catégories — plus stylée
-        with ui.row().classes("w-full q-mt-lg items-center gap-2 justify-center"):
-            ui.label("Catégories :").classes("text-caption text-grey-5")
-            for cat, abbr in self._CAT_ABBREV.items():
-                if cat == "":
-                    continue
-                hex_c = self._CAT_HEX.get(cat, "#78909C")
-                with ui.element("div").style(
-                    f"background:{hex_c}; color:white; padding:4px 10px; "
-                    f"border-radius:12px; font-size:11px; font-weight:600; "
-                    f"letter-spacing:0.5px;"
-                ):
-                    ui.label(f"{abbr.upper()} · {cat}")
+        # Légende — catégories ou tags selon le mode
+        with ui.row().classes("w-full q-mt-lg items-center gap-2 justify-center").style(
+            "flex-wrap:wrap;"
+        ):
+            if group_mode == "tag":
+                ui.label("Tags :").classes("text-caption text-grey-5")
+                # Récupère les tags réellement présents dans l'index filtré
+                present_tags: set[str] = set()
+                for drones in index.values():
+                    for entries in drones.values():
+                        present_tags.update(entries.keys())
+                for tag_name in sorted(present_tags):
+                    hex_c = self._tag_hex(tag_name)
+                    icon = self._tag_icon(tag_name)
+                    with ui.element("div").style(
+                        f"background:{hex_c}; color:white; padding:4px 10px; "
+                        f"border-radius:12px; font-size:11px; font-weight:600; "
+                        f"letter-spacing:0.5px; display:inline-flex; "
+                        f"align-items:center; gap:4px;"
+                    ):
+                        ui.label(icon).style("font-size:12px;")
+                        ui.label(tag_name)
+            else:
+                ui.label("Catégories :").classes("text-caption text-grey-5")
+                for cat, abbr in self._CAT_ABBREV.items():
+                    if cat == "":
+                        continue
+                    hex_c = self._CAT_HEX.get(cat, "#78909C")
+                    with ui.element("div").style(
+                        f"background:{hex_c}; color:white; padding:4px 10px; "
+                        f"border-radius:12px; font-size:11px; font-weight:600; "
+                        f"letter-spacing:0.5px;"
+                    ):
+                        ui.label(f"{abbr.upper()} · {cat}")
+
+    def _tag_abbrev(self, tag_name: str) -> str:
+        """Abréviation compacte d'un tag pour l'affichage dans une cellule de calendrier."""
+        s = "".join(ch for ch in tag_name if ch.isalnum())
+        if not s:
+            return "tag"
+        return s[:5].lower()
 
     def _render_calendar_day_cell(
         self,
@@ -4864,6 +6070,7 @@ class DJIOrganizatorApp:
         day_data: dict[str, dict[str, int]],
         is_current_month: bool,
         is_today: bool,
+        group_mode: str = "cat",
     ) -> None:
         """Cellule d'un jour dans la grille calendrier — version stylée."""
         has_data = bool(day_data)
@@ -4910,7 +6117,7 @@ class DJIOrganizatorApp:
                 )
                 ui.space()
                 if has_data:
-                    total = sum(cnt for cats in day_data.values() for cnt in cats.values())
+                    total = sum(cnt for entries in day_data.values() for cnt in entries.values())
                     with ui.element("div").classes("cal-mono").style(
                         "background:rgba(33,150,243,0.85); color:white; "
                         "padding:1px 8px; border-radius:10px; font-size:11px; "
@@ -4918,9 +6125,9 @@ class DJIOrganizatorApp:
                     ):
                         ui.label(str(total))
 
-            # Corps : lignes drone + chips catégories
+            # Corps : lignes drone + chips (catégorie ou tag selon le mode)
             if has_data:
-                for drone_id, cats in day_data.items():
+                for drone_id, entries in day_data.items():
                     short = self._drone_short_id(drone_id)
                     d_hex = self._drone_hex(drone_id)
                     with ui.row().classes("items-center no-wrap w-full gap-1").style(
@@ -4932,24 +6139,42 @@ class DJIOrganizatorApp:
                             f"border-radius:6px; font-size:10px; font-weight:700; "
                             f"letter-spacing:0.5px; flex-shrink:0;"
                         )
-                        # Chips par catégorie
-                        for cat, n in cats.items():
-                            abbr = self._CAT_ABBREV.get(cat, cat.lower() or "misc")
-                            hex_c = self._CAT_HEX.get(cat, "#78909C")
-                            ui.label(f"{n}{abbr}").classes("cal-mono").style(
-                                f"color:{hex_c}; font-size:11px; font-weight:600; "
-                                f"padding:0 3px; flex-shrink:0;"
+                        # Chips : catégories OU tags (tri par occurrence descendante)
+                        if group_mode == "tag":
+                            sorted_items = sorted(
+                                entries.items(),
+                                key=lambda kv: (-kv[1], kv[0]),
                             )
+                            for tag_name, n in sorted_items:
+                                hex_c = self._tag_hex(tag_name)
+                                abbr = self._tag_abbrev(tag_name)
+                                ui.label(f"{n}{abbr}").classes("cal-mono").style(
+                                    f"color:{hex_c}; font-size:11px; font-weight:600; "
+                                    f"padding:0 3px; flex-shrink:0;"
+                                ).tooltip(f"{tag_name} — {n} média(s)")
+                        else:
+                            for cat, n in entries.items():
+                                abbr = self._CAT_ABBREV.get(cat, cat.lower() or "misc")
+                                hex_c = self._CAT_HEX.get(cat, "#78909C")
+                                ui.label(f"{n}{abbr}").classes("cal-mono").style(
+                                    f"color:{hex_c}; font-size:11px; font-weight:600; "
+                                    f"padding:0 3px; flex-shrink:0;"
+                                )
 
     def _open_calendar_day_dialog(
         self,
         date_str: str,
         day_data: dict[str, dict[str, int]],
     ) -> None:
-        """Ouvre un dialog listant les médias d'un jour, groupés par drone/catégorie."""
+        """Ouvre un dialog listant les médias d'un jour, groupés par drone/catégorie.
+
+        En mode « par tag », `day_data` contient `{drone: {tag: count}}` — on
+        scanne alors tous les fichiers du jour et on filtre ceux qui portent
+        au moins un des tags demandés.
+        """
         dest = Path(self.destination_dir)
-        # Résout les chemins
         drone_by_id = {d.get("id"): d for d in CONFIG.get("drone_mapping", [])}
+        group_mode = self._calendar_state.get("group_mode", "cat")
 
         loading_placeholder: list[Any] = []
 
@@ -5022,14 +6247,44 @@ class DJIOrganizatorApp:
                     return True
 
             result: dict[str, dict[str, list[Path]]] = {}
-            for drone_id, cats in day_data.items():
+            for drone_id, entries in day_data.items():
                 drone = drone_by_id.get(drone_id)
                 if not drone:
                     continue
                 base = dest / drone.get("folder", "") / date_str
                 if not base.is_dir():
                     continue
-                for cat in cats.keys():
+                if group_mode == "tag":
+                    # `entries` = {tag_name: count} — scanne tous les fichiers
+                    # du jour et ne garde que ceux qui portent au moins un
+                    # des tags demandés (== clés de entries).
+                    wanted_tags = set(entries.keys())
+                    files_by_cat: dict[str, list[Path]] = {}
+                    for f in base.rglob("*"):
+                        if not f.is_file():
+                            continue
+                        if f.suffix.lower() not in ALL_MEDIA_EXTS:
+                            continue
+                        if not _visible(f):
+                            continue
+                        try:
+                            file_tags = set(self._read_sidecar_tags(f))
+                        except Exception:
+                            continue
+                        if not (file_tags & wanted_tags):
+                            continue
+                        try:
+                            rel = f.relative_to(base)
+                            cat = rel.parts[0] if len(rel.parts) > 1 else ""
+                        except ValueError:
+                            cat = ""
+                        files_by_cat.setdefault(cat, []).append(f)
+                    for cat, fs in files_by_cat.items():
+                        fs.sort()
+                        result.setdefault(drone_id, {})[cat] = fs
+                    continue
+                # Mode catégorie : entries = {cat: count}
+                for cat in entries.keys():
                     if cat:
                         cat_dir = base / cat
                         if cat_dir.is_dir():
@@ -5122,11 +6377,19 @@ class DJIOrganizatorApp:
                                 "text-caption text-grey-5"
                             )
                     for cat, files in cats.items():
-                        title = f"📁 {cat} ({len(files)})" if cat else f"📼 Racine ({len(files)})"
+                        items = self._partition_disk_files(files)
+                        title = f"📁 {cat} ({len(items)})" if cat else f"📼 Racine ({len(items)})"
                         ui.label(title).classes("text-subtitle2 q-mt-sm")
                         with ui.grid(columns=5).classes("w-full gap-2"):
-                            for f in files:
-                                self._render_viewer_media_card(f)
+                            for item in items:
+                                if item["kind"] == "single":
+                                    self._render_viewer_media_card(item["path"])
+                                else:
+                                    self._render_viewer_group_card(
+                                        item["category"],
+                                        item["group_subdir"],
+                                        item["files"],
+                                    )
 
         # Holder mémorisant les fichiers chargés — permet _rebuild_content
         files_by_drone_holder: dict[str, dict[str, list[Path]]] = {}
@@ -5135,11 +6398,16 @@ class DJIOrganizatorApp:
         dlg.open()
 
     def _open_preview_from_disk(
-        self, file_path: Path, on_deleted: Optional[Callable[[], None]] = None
+        self,
+        file_path: Path,
+        on_deleted: Optional[Callable[[], None]] = None,
+        on_close: Optional[Callable[[], None]] = None,
     ) -> None:
         """Charge un MediaUnit depuis le sidecar .dji.json (ou fallback minimal)."""
         unit = self._build_unit_from_disk(file_path)
-        self._open_preview_dialog(unit, source="viewer", on_deleted=on_deleted)
+        self._open_preview_dialog(
+            unit, source="viewer", on_deleted=on_deleted, on_close=on_close
+        )
 
     def _build_unit_from_disk(self, file_path: Path) -> MediaUnit:
         """Reconstruit un MediaUnit à partir du sidecar .dji.json (ou minimal)."""
@@ -5182,6 +6450,7 @@ class DJIOrganizatorApp:
                 detection_reason=cls.get("detection_reason", ""),
                 action="skip",
                 tags=list(cls.get("tags", []) or []),
+                custom_name=str(cls.get("custom_name", "") or ""),
             )
 
         # Fallback minimal — pas de sidecar
@@ -5269,6 +6538,37 @@ class DJIOrganizatorApp:
                 changed += 1
         return changed
 
+    def _open_rename_dialog(
+        self,
+        current: str,
+        title: str,
+        subtitle: str,
+        on_save: Callable[[str], None],
+    ) -> None:
+        """Ouvre un petit dialog pour saisir/modifier un nom personnalisé."""
+        with ui.dialog() as d, ui.card().classes("q-pa-md").style("min-width:380px;"):
+            ui.label(title).classes("text-h6")
+            if subtitle:
+                ui.label(subtitle).classes("text-caption text-grey-6")
+            name_input = ui.input(
+                label="Nom personnalisé",
+                value=current or "",
+                placeholder="ex. Vol tôt matin, coucher soleil…",
+            ).props("dense autofocus outlined clearable").classes("w-full q-mt-sm")
+            with ui.row().classes("w-full justify-end gap-2 q-mt-md"):
+                ui.button("Annuler", on_click=d.close).props("flat")
+
+                def _save() -> None:
+                    val = (name_input.value or "").strip()
+                    d.close()
+                    on_save(val)
+
+                ui.button("Enregistrer", on_click=_save).props(
+                    "unelevated color=primary"
+                )
+            name_input.on("keydown.enter", lambda: _save())
+        d.open()
+
     def _sidecar_path_for(self, file_path: str) -> Optional[Path]:
         """Retourne le chemin du sidecar `.dji.json` pour un média destination."""
         p = Path(file_path)
@@ -5300,6 +6600,8 @@ class DJIOrganizatorApp:
         try:
             with open(sc, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+            # Le cache de l'index-par-tag n'est plus valide.
+            self._calendar_tag_index_cache = None
             return True
         except Exception as e:
             self.log(f"⚠️ Écriture sidecar échouée ({sc}): {e}")
@@ -5319,6 +6621,47 @@ class DJIOrganizatorApp:
                 except Exception:
                     return []
         return []
+
+    def _read_sidecar_custom_name(self, file_path: Path) -> str:
+        """Lit le nom personnalisé depuis le sidecar (chaîne vide si absent)."""
+        for cand in (
+            file_path.with_suffix(file_path.suffix + ".dji.json"),
+            file_path.with_suffix(".dji.json"),
+        ):
+            if cand.exists():
+                try:
+                    with open(cand, "r", encoding="utf-8") as f:
+                        payload = json.load(f)
+                    return str(
+                        payload.get("classification", {}).get("custom_name", "") or ""
+                    )
+                except Exception:
+                    return ""
+        return ""
+
+    def _update_sidecar_custom_name(self, file_path: str, name: str) -> bool:
+        """Met à jour `custom_name` dans le sidecar `.dji.json`.
+
+        Retourne True si le sidecar existait et a été mis à jour."""
+        sc = self._sidecar_path_for(file_path)
+        if sc is None:
+            return False
+        try:
+            with open(sc, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            self.log(f"⚠️ Lecture sidecar échouée ({sc}): {e}")
+            return False
+        cls = payload.setdefault("classification", {})
+        cls["custom_name"] = (name or "").strip()
+        payload["custom_name_updated_at"] = datetime.now().isoformat()
+        try:
+            with open(sc, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+            return True
+        except Exception as e:
+            self.log(f"⚠️ Écriture sidecar échouée ({sc}): {e}")
+            return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5349,6 +6692,53 @@ if __name__ in {"__main__", "__mp_main__"}:
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8192)
     args, _ = parser.parse_known_args()
+
+    # ── Filtre l'exception Windows bruyante mais bénigne :
+    #   ConnectionResetError: [WinError 10054] An existing connection was
+    #   forcibly closed by the remote host — se produit quand le navigateur
+    #   (ou pywebview) ferme brusquement une connexion HTTP/WS. Sans impact
+    #   fonctionnel — on la fait juste taire.
+    def _install_quiet_asyncio_handler() -> None:
+        try:
+            import asyncio as _asyncio
+            import logging as _logging
+
+            def _quiet_handler(loop, ctx):
+                exc = ctx.get("exception")
+                msg = ctx.get("message", "")
+                if isinstance(exc, ConnectionResetError):
+                    return
+                if "forcibly closed by the remote host" in str(msg):
+                    return
+                if "connection lost" in str(msg).lower() and isinstance(
+                    exc, (ConnectionError, OSError)
+                ):
+                    return
+                loop.default_exception_handler(ctx)
+
+            try:
+                loop = _asyncio.get_event_loop()
+                loop.set_exception_handler(_quiet_handler)
+            except RuntimeError:
+                pass
+
+            # Filtre au niveau logging aussi (asyncio.log)
+            class _AsyncioQuietFilter(_logging.Filter):
+                def filter(self, record: _logging.LogRecord) -> bool:
+                    msg = record.getMessage()
+                    if "ConnectionResetError" in msg:
+                        return False
+                    if "forcibly closed by the remote host" in msg:
+                        return False
+                    if "_call_connection_lost" in msg:
+                        return False
+                    return True
+
+            _logging.getLogger("asyncio").addFilter(_AsyncioQuietFilter())
+        except Exception:
+            pass
+
+    _install_quiet_asyncio_handler()
 
     if args.server_only:
         try:
