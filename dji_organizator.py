@@ -276,7 +276,23 @@ class DJIMetadataExtractor:
                 # -a : tags dupliqués OK
                 # -j : json
                 # -n : valeurs numériques brutes (utile pour GPS)
-                metadata_list = et.get_metadata(files, params=["-G", "-a", "-n"])
+                common_args = ["-G", "-a", "-n"]
+                # Compatibilité ancienne vs nouvelle version de pyexiftool :
+                # les versions récentes (≥0.7?) ont supprimé params= au profit de common_args=
+                import inspect as _inspect
+                try:
+                    _sig = _inspect.signature(et.get_metadata)
+                    _params_ok = "params" in _sig.parameters
+                except Exception:
+                    _params_ok = True  # fallback : on tente params par défaut
+                try:
+                    if _params_ok:
+                        metadata_list = et.get_metadata(files, params=common_args)
+                    else:
+                        metadata_list = et.get_metadata(files, common_args=common_args)
+                except TypeError:
+                    # dernière chance : appels directs sans argument nommé
+                    metadata_list = et.get_metadata(files, common_args)
                 for i, meta in enumerate(metadata_list):
                     source = meta.get("SourceFile", files[i] if i < len(files) else "")
                     source_norm = os.path.normpath(source)
@@ -2138,6 +2154,17 @@ class DJIOrganizatorApp:
             async def run_scan() -> None:
                 self._scan_progress_label.text = "Initialisation…"
                 self._scan_progress_bar.value = 0.0
+                # Vérifier que le dossier source existe (gère lecteur réseau/externe déconnecté)
+                if not self.source_dir or not os.path.isdir(self.source_dir):
+                    ui.notify(
+                        f"Dossier source introuvable ou inaccessible : {self.source_dir!r}\n"
+                        "Vérifiez que le lecteur est connecté.",
+                        type="negative",
+                        timeout=10000,
+                    )
+                    self.units = []
+                    self._scan_progress_label.text = "❌ Dossier inaccessible"
+                    return
                 try:
                     scanner = DJIScanner(self.source_dir)
                 except Exception as e:
@@ -2169,23 +2196,36 @@ class DJIOrganizatorApp:
     def _step_review(self) -> None:
         with ui.tab_panel("review"):
             with ui.card().classes("w-full"):
+                # Si la liste de résultats est vide (scan non effectué ou dossier inaccessible),
+                # afficher un message clair au lieu de construire des widgets de filtre qui plantent.
+                if not self.units:
+                    with ui.row().classes("w-full items-center gap-3"):
+                        ui.icon("info").classes("text-grey-5")
+                        ui.label(
+                            "Aucun média à afficher. \n"
+                            "Vérifiez que le dossier source est bien configuré et accessible."
+                        ).classes("text-body2 text-grey-6")
+                    return
                 with ui.row().classes("w-full items-center gap-2"):
                     ui.label("Filtres :").classes("text-body2")
+                    _drone_opts = ["TOUS"] + list({u.drone_id for u in self.units if u.drone_id})
+                    _cat_opts = ["TOUTES"] + list({u.category for u in self.units if u.category})
+                    _tag_opts  = ["TOUS"] + self._tag_names()
                     self._drone_filter_sel = ui.select(
-                        options=["TOUS"],
-                        value="TOUS",
+                        options=_drone_opts,
+                        value=_drone_opts[0],
                         on_change=lambda e: self._apply_filters(),
                         label="Drone",
                     ).classes("min-w-32")
                     self._cat_filter_sel = ui.select(
-                        options=["TOUTES"] + CATEGORIES,
-                        value="TOUTES",
+                        options=_cat_opts,
+                        value=_cat_opts[0],
                         on_change=lambda e: self._apply_filters(),
                         label="Catégorie",
                     ).classes("min-w-32")
                     self._tag_filter_sel = ui.select(
-                        options=["TOUS"] + self._tag_names(),
-                        value="TOUS",
+                        options=_tag_opts,
+                        value=_tag_opts[0],
                         on_change=lambda e: self._apply_filters(),
                         label="Tag",
                     ).classes("min-w-32")
@@ -2198,9 +2238,11 @@ class DJIOrganizatorApp:
                 with ui.row().classes("w-full items-center gap-2 mt-2"):
                     ui.label("Réassigner drone des filtrés :").classes("text-body2")
                     drone_ids = [d["id"] for d in CONFIG.get("drone_mapping", [])]
+                    drone_ids = [d["id"] for d in CONFIG.get("drone_mapping", [])]
+                    _bulk_val = drone_ids[0] if drone_ids else None
                     self._bulk_drone_target = ui.select(
-                        options=drone_ids,
-                        value=drone_ids[0] if drone_ids else "MINI2-MEO",
+                        options=drone_ids if drone_ids else ["—Aucun drone configuré—"],
+                        value=_bulk_val,
                         label="→ Drone cible",
                     ).classes("min-w-40")
                     ui.button(
@@ -4091,7 +4133,7 @@ class DJIOrganizatorApp:
                             ui.icon("flight").classes("text-5xl text-grey-6")
                     img_sel = ui.select(
                         options=available_images,
-                        value=img_rel if img_rel in available_images else "",
+                        value=img_rel if img_rel in available_images else (available_images[0] if available_images else None),
                         label="Image",
                     ).props("dense options-dense").classes("w-32")
 

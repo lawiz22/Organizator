@@ -77,9 +77,11 @@ except ImportError:
     print("⚠️ InsightFace indisponible. Installez insightface et onnxruntime-gpu pour la recherche par visage.")
 
 from PIL import Image, ImageFile, ExifTags
+import onnxruntime as rt
+import pandas as pd
 from huggingface_hub import snapshot_download
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
-from transformers import AutoImageProcessor, AutoModelForImageClassification, SiglipForImageClassification
+from transformers import AutoImageProcessor, AutoModelForImageClassification, SiglipForImageClassification, BitsAndBytesConfig
 from nicegui import app, ui, run
 from fastapi.responses import FileResponse, Response
 from fastapi import Body
@@ -282,19 +284,23 @@ NSFW_PROMPT_SENSUAL_KEYWORDS = (
 )
 
 
+# Précompilation lazy par clé de keyword-set → regex compilée
+_nsfw_prompt_cache: dict[tuple[str, ...], re.Pattern] = {}
+
 def _nsfw_prompt_match(text_lower, keywords):
-    """Retourne la liste des mots-clés trouvés via une regex à frontières larges
-    (séparateurs: espace, virgule, point, _, -, :, /, |, parenthèses, fin de ligne)."""
+    """Retourne la liste des mots-cles trouves via une regex a frontieres larges
+    (separateurs: espace, virgule, point, _, -, :, /, |, parentheses, fin de ligne)."""
     if not text_lower:
         return []
-    found = []
-    for kw in keywords:
-        kw_l = kw.lower()
-        # Echappement + frontière personnalisée: tout caractère non-[a-z0-9] OU bord
-        pattern = r'(?:(?<=^)|(?<=[^a-z0-9]))' + re.escape(kw_l) + r'(?=$|[^a-z0-9])'
-        if re.search(pattern, text_lower):
-            found.append(kw_l)
-    return found
+    # Cle stable (tuple frozenset) pour cacher la regex compilee
+    cache_key = tuple(sorted(keywords)) if keywords else ()
+    if cache_key not in _nsfw_prompt_cache:
+        compiled = {kw.lower(): re.compile(
+            r'(?:(?<=^)|(?<=[^a-z0-9]))' + re.escape(kw.lower()) + r'(?=$|[^a-z0-9])'
+        ) for kw in keywords}
+        _nsfw_prompt_cache[cache_key] = compiled
+    compiled = _nsfw_prompt_cache[cache_key]
+    return [kw for kw, pat in compiled.items() if pat.search(text_lower)]
 
 
 def classify_nsfw_by_prompt(text):
@@ -1981,7 +1987,6 @@ class SearchEngine:
         if self.quant_mode != "None" and self.device == "cuda":
             kwargs["device_map"] = {"": self.device}
             try:
-                from transformers import BitsAndBytesConfig
                 if self.quant_mode == "8-bit":
                     kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
                 elif self.quant_mode == "4-bit":
@@ -2677,7 +2682,6 @@ class NsfwEngine:
             if self.quant_mode != "None" and self.device == "cuda":
                 kwargs["device_map"] = {"": self.device}
                 try:
-                    from transformers import BitsAndBytesConfig
                     if self.quant_mode == "8-bit":
                         kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
                     elif self.quant_mode == "4-bit":
@@ -3087,8 +3091,7 @@ class NsfwEngine:
                     
                     # PRÉ-FILTRE 2: vérifier si c'est un portrait/visage (close-up ou détecté)
                     try:
-                        from PIL import Image as _PIL
-                        with _PIL.open(img_path) as _raw:
+                        with Image.open(img_path) as _raw:
                             _ow, _oh = _raw.size
                     except Exception:
                         _ow, _oh = 0, 0
@@ -5426,14 +5429,22 @@ def reveal_file_native(filepath):
     except Exception as e: 
         ui.notify(f"Erreur d'ouverture du dossier : {e}", type='negative')
 
+# Lazy Tkinter singleton (evite import au module level pour les env headless)
+_tk_root = None
+
+def _get_tk_root():
+    global _tk_root
+    if _tk_root is None:
+        import tkinter as tk
+        _tk_root = tk.Tk()
+        _tk_root.attributes('-topmost', True)
+        _tk_root.withdraw()
+    return _tk_root
+
 def pick_folder_native():
-    import tkinter as tk
+    root = _get_tk_root()
     from tkinter import filedialog
-    root = tk.Tk()
-    root.attributes('-topmost', True)
-    root.withdraw()
     folder = filedialog.askdirectory()
-    root.destroy()
     return folder
 
 async def select_folder(input_element):
@@ -5441,13 +5452,9 @@ async def select_folder(input_element):
     if folder: input_element.value = folder
 
 def pick_file_native():
-    import tkinter as tk
+    root = _get_tk_root()
     from tkinter import filedialog
-    root = tk.Tk()
-    root.attributes('-topmost', True)
-    root.withdraw()
     file = filedialog.askopenfilename(filetypes=[("Image files", "*.jpg *.jpeg *.png *.webp *.bmp *.tiff")])
-    root.destroy()
     return file
 
 async def select_file(input_element):
@@ -5455,13 +5462,9 @@ async def select_file(input_element):
     if file: input_element.value = file
 
 def pick_files_native():
-    import tkinter as tk
+    root = _get_tk_root()
     from tkinter import filedialog
-    root = tk.Tk()
-    root.attributes('-topmost', True)
-    root.withdraw()
     files = filedialog.askopenfilenames(filetypes=[("Image files", "*.jpg *.jpeg *.png *.webp *.bmp *.tiff")])
-    root.destroy()
     return list(files) if files else []
 
 def clear_folder_cache(folder_path):
@@ -5837,7 +5840,6 @@ def copy_image_to_clipboard(path):
         if os.name == 'nt':
             import ctypes
             from PIL import Image
-            import io
             
             # Lecture image via PIL (compatible webp)
             img = Image.open(path).convert('RGB')
@@ -7831,9 +7833,8 @@ def index_page():
         # 1) Sidecar (rapide, deja calcule)
         if os.path.isfile(json_path):
             try:
-                import json as _j
                 with open(json_path, 'r', encoding='utf-8') as _f:
-                    data = _j.load(_f)
+                    data = json.load(_f)
                 raw = data.get('result', {}).get('tier', '')
                 if raw:
                     tier = str(raw).upper()
@@ -7855,8 +7856,7 @@ def index_page():
                     elif top_label not in ('ERROR', 'NO_PERSON', 'PORTRAIT', ''):
                         # Tente une reclassification depuis les details bruts
                         try:
-                            import json as _j
-                            det = _j.loads(row[2]) if row[2] else {}
+                            det = json.loads(row[2]) if row[2] else {}
                             if isinstance(det, dict) and det:
                                 tier = classify_nsfw_tier(
                                     det,
@@ -7918,9 +7918,8 @@ def index_page():
             ia_path = stem + '.ia'
             if os.path.isfile(ia_path):
                 try:
-                    import json as _j
                     with open(ia_path, 'r', encoding='utf-8') as _f:
-                        data = _j.load(_f)
+                        data = json.load(_f)
                     if data.get('is_ai') is not None:
                         verdict = bool(data['is_ai'])
                 except Exception:
