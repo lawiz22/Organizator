@@ -2196,16 +2196,11 @@ class DJIOrganizatorApp:
     def _step_review(self) -> None:
         with ui.tab_panel("review"):
             with ui.card().classes("w-full"):
-                # Si la liste de résultats est vide (scan non effectué ou dossier inaccessible),
-                # afficher un message clair au lieu de construire des widgets de filtre qui plantent.
-                if not self.units:
-                    with ui.row().classes("w-full items-center gap-3"):
-                        ui.icon("info").classes("text-grey-5")
-                        ui.label(
-                            "Aucun média à afficher. \n"
-                            "Vérifiez que le dossier source est bien configuré et accessible."
-                        ).classes("text-body2 text-grey-6")
-                    return
+                # Les widgets (filtres + conteneur) sont TOUJOURS créés, même si
+                # `self.units` est vide au build : après un scan, `_refresh_review`
+                # → `_apply_filters` a besoin que `self._review_container` existe
+                # pour pouvoir rendre les résultats. Le rendu du message "vide"
+                # est géré par `_apply_filters` lorsque la liste filtrée est nulle.
                 with ui.row().classes("w-full items-center gap-2"):
                     ui.label("Filtres :").classes("text-body2")
                     _drone_opts = ["TOUS"] + list({u.drone_id for u in self.units if u.drone_id})

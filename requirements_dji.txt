@@ -1,12 +1,23 @@
-# Dépendances supplémentaires pour DJI_organizator
-# (complète requirements.txt de MediaMind AI, utilise le même .venv)
+# Dépendances DJI Organizator — auto-suffisantes (n'importe PAS la stack
+# torch/CUDA de requirements.txt utilisée par MediaMind AI).
+#
+# Installation :
+#   .venv\Scripts\python.exe -m pip install -r requirements_dji.txt
+# ou via UV :
+#   .uv\uv.exe pip install -r requirements_dji.txt
 
-# Wrapper Python pour ExifTool (lecture complète métadonnées DJI incl. XMP)
+# ── UI ────────────────────────────────────────────────────────────────────
+nicegui>=3.0.0
+pywebview>=5.0
+
+# ── Métadonnées photos/vidéos DJI (EXIF/XMP complet via ExifTool) ────────
 PyExifTool>=0.5.6
 
-# Corbeille (Windows/macOS/Linux) — déjà installé côté organizator
-send2trash>=1.8.3
-
-# Image / vidéo thumbnails
+# ── Génération thumbnails photos ─────────────────────────────────────────
 Pillow>=10.0.0
+
+# ── Génération thumbnails vidéos (extraction 1 frame) ────────────────────
 opencv-python>=4.9.0
+
+# ── Corbeille système (Windows/macOS/Linux) ──────────────────────────────
+send2trash>=1.8.3
